@@ -4,7 +4,7 @@
     "name": "eye_anim",
     "align": "GFX_ALIGN_LEFT_MID",
     "x": -5,
-    "y": 24,
+    "y": 8,
     "anim": {
       "mirror": "auto"
     }
@@ -14,7 +14,7 @@
     "name": "emerg_dlg",
     "align": "GFX_ALIGN_LEFT_MID",
     "x": -5,
-    "y": 24,
+    "y": 8,
     "anim": {
       "mirror": "auto"
     }
