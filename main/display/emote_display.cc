@@ -382,6 +382,14 @@ void EmoteDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     const int x0 = (src_w - crop_w) / 2;
     const int y0 = (src_h - crop_h) / 2;
 
+    // 上一张还挂着的话先收起：渲染任务随时可能读这块缓冲，
+    // 边写边读会看到半张新、半张旧的撕裂帧。
+    if (gfx_obj_get_visible(preview_->obj)) {
+        emote_lock(emote_handle_);
+        gfx_obj_set_visible(preview_->obj, false);
+        emote_unlock(emote_handle_);
+    }
+
     for (int y = 0; y < height_; y++) {
         const int sy = y0 + static_cast<int>(static_cast<int64_t>(y) * crop_h / height_);
         const uint8_t* row = src->data + static_cast<size_t>(sy) * src_stride;
