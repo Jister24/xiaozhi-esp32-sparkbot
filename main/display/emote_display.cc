@@ -396,7 +396,13 @@ void EmoteDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
         uint16_t* dst = preview_->buf + static_cast<size_t>(y) * width_;
         for (int x = 0; x < width_; x++) {
             const int sx = x0 + static_cast<int>(static_cast<int64_t>(x) * crop_w / width_);
-            memcpy(&dst[x], row + static_cast<size_t>(sx) * 2, sizeof(uint16_t));
+            uint16_t px;
+            memcpy(&px, row + static_cast<size_t>(sx) * 2, sizeof(uint16_t));
+            // gfx 的图像绘制路径是裸 memcpy，注释写着 "src_buf is expected to already be
+            // in native framebuffer order"——它不会像 EAF 解码器那样调
+            // gfx_color_to_native_u16 做转换。而本板 emote 初始化设了 swap=true，
+            // 帧缓冲要的是字节翻转的 RGB565；摄像头给的是小端。不翻就是满屏雪花。
+            dst[x] = static_cast<uint16_t>((px >> 8) | (px << 8));
         }
     }
 
