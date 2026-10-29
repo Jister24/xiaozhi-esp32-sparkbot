@@ -17,7 +17,6 @@ int64_t GetMicrosecondsSinceLastFlush();
 
 class EmoteDisplay : public Display {
 public:
-    using Display::SetPreviewImage;
 
     EmoteDisplay(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t panel_io, int width,
                  int height);
@@ -30,7 +29,9 @@ public:
     virtual void ShowNotification(const char* notification, int duration_ms = 3000) override;
     virtual void UpdateStatusBar(bool update_all = false) override;
     virtual void SetPowerSaveMode(bool on) override;
-    virtual void SetPreviewImage(const void* image);
+    // PHOTO_PREVIEW: 拍照后把这一帧铺满屏幕 5 秒，再让回表情。
+    // 摄像头（EspVideo::Capture）拍完会把解码好的 RGB565 帧交给这里。
+    virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override;
 
     bool StopAnimDialog();
     virtual bool InsertAnimDialog(const char* emoji_name, uint32_t duration_ms) override;
@@ -48,7 +49,16 @@ private:
     virtual bool Lock(int timeout_ms = 0) override;
     virtual void Unlock() override;
 
+    // PHOTO_PREVIEW: 一张照片要占满屏幕显示几秒，用 gfx 的自定义 image 对象承载，
+    // 这样它和表情走同一条渲染/刷屏链路，不会和渲染任务抢 panel。
+    struct PreviewState;
+    static void OnPreviewTimeout(void* arg);
+    void HidePreview();
+
     emote_handle_t emote_handle_ = nullptr;
+    int width_ = 0;
+    int height_ = 0;
+    PreviewState* preview_ = nullptr;
 };
 
 }  // namespace emote

@@ -14,6 +14,7 @@
 #include <time.h>
 
 // ESP-IDF headers
+#include <esp_heap_caps.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -164,9 +165,19 @@ static emote_handle_t InitializeEmote(const esp_lcd_panel_handle_t panel, const 
 // EmoteDisplay Class Implementation
 // ============================================================================
 
+// 一张照片要占满屏幕显示几秒，用 gfx 的自定义 image 对象承载：
+// 它和表情走同一条渲染/刷屏链路，不会和渲染任务抢 panel。
+struct EmoteDisplay::PreviewState {
+    gfx_obj_t* obj = nullptr;
+    gfx_image_dsc_t dsc = {};
+    uint16_t* buf = nullptr;      // 铺满屏幕后的 RGB565 像素，gfx 直接从这里取
+    esp_timer_handle_t timer = nullptr;
+};
+
 EmoteDisplay::EmoteDisplay(const esp_lcd_panel_handle_t panel,
                            const esp_lcd_panel_io_handle_t panel_io, const int width,
-                           const int height) {
+                           const int height)
+    : width_(width), height_(height) {
     emote_handle_ = InitializeEmote(panel, width, height);
 
     const esp_lcd_panel_io_callbacks_t cbs = {
@@ -176,6 +187,17 @@ EmoteDisplay::EmoteDisplay(const esp_lcd_panel_handle_t panel,
 }
 
 EmoteDisplay::~EmoteDisplay() {
+    if (preview_ != nullptr) {
+        if (preview_->timer != nullptr) {
+            esp_timer_delete(preview_->timer);
+        }
+        // 图像对象挂在 display 的子对象链上，emote_deinit 会一并销毁
+        if (preview_->buf != nullptr) {
+            heap_caps_free(preview_->buf);
+        }
+        delete preview_;
+        preview_ = nullptr;
+    }
     if (emote_handle_) {
         emote_deinit(emote_handle_);
         emote_handle_ = nullptr;
@@ -252,10 +274,140 @@ void EmoteDisplay::SetPowerSaveMode(bool on) {
     }
 }
 
-void EmoteDisplay::SetPreviewImage(const void* image) {
-    if (image) {
-        ESP_LOGI(TAG, "SetPreviewImage: Preview image not supported, using default icon");
+// ============================================================================
+// PHOTO_PREVIEW: 拍照后在屏幕上显示几秒刚拍的照片
+// ============================================================================
+//
+// 走 gfx 的自定义 image 对象而不是直接 esp_lcd_panel_draw_bitmap：
+// 表情由 emote 的渲染任务逐帧重绘，绕开它往 panel 上写会被下一帧覆盖；
+// 而渲染任务的刷屏等待没有任何公开的暂停接口，硬抢会把它卡在 flush 上。
+// 做成子对象后，它排在列表末尾（后创建 = 后绘制），每帧盖在表情上面，
+// 收起时置 visible=false，渲染任务自己会把这块区域按背景色重画回表情。
+
+// 一张照片停留多久。改这里就是改体验，注意别和"拍完就开始说话"打架。
+static constexpr uint32_t kPreviewDurationMs = 5000;
+
+void EmoteDisplay::OnPreviewTimeout(void* arg) {
+    if (arg != nullptr) {
+        static_cast<EmoteDisplay*>(arg)->HidePreview();
     }
+}
+
+void EmoteDisplay::HidePreview() {
+    if (preview_ == nullptr || preview_->obj == nullptr || emote_handle_ == nullptr) {
+        return;
+    }
+    emote_lock(emote_handle_);
+    gfx_obj_set_visible(preview_->obj, false);
+    emote_unlock(emote_handle_);
+}
+
+void EmoteDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
+    if (emote_handle_ == nullptr || image == nullptr) {
+        return;
+    }
+    const lv_img_dsc_t* src = image->image_dsc();
+    if (src == nullptr || src->data == nullptr || src->header.w == 0 || src->header.h == 0) {
+        ESP_LOGW(TAG, "preview: empty image, ignored");
+        return;
+    }
+    // 摄像头预览这条路径只会给我们 RGB565（YUV/JPEG 在 esp_video 里已经转好了）
+    if (src->header.cf != LV_COLOR_FORMAT_RGB565) {
+        ESP_LOGW(TAG, "preview: color format %u not supported, only RGB565 is drawn",
+                 static_cast<unsigned>(src->header.cf));
+        return;
+    }
+    if (width_ <= 0 || height_ <= 0) {
+        return;
+    }
+
+    if (preview_ == nullptr) {
+        auto state = std::make_unique<PreviewState>();
+        const size_t bytes = static_cast<size_t>(width_) * height_ * 2;
+        state->buf = static_cast<uint16_t*>(
+            heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (state->buf == nullptr) {
+            state->buf = static_cast<uint16_t*>(heap_caps_malloc(bytes, MALLOC_CAP_8BIT));
+        }
+        if (state->buf == nullptr) {
+            ESP_LOGE(TAG, "preview: no memory for a %dx%d frame (%u bytes)", width_, height_,
+                     static_cast<unsigned>(bytes));
+            return;
+        }
+
+        state->obj = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_IMAGE, "photo_preview");
+        if (state->obj == nullptr) {
+            ESP_LOGE(TAG, "preview: failed to create photo_preview object");
+            heap_caps_free(state->buf);
+            return;
+        }
+
+        // 描述符布局和 lv_image_header_t 完全一致，gfx 只认第一个字节的 magic，
+        // 数据按行紧凑排布（gfx 的绘制路径固定用 image_width 当 stride）。
+        state->dsc.header.magic = C_ARRAY_HEADER_MAGIC;
+        state->dsc.header.cf = GFX_COLOR_FORMAT_RGB565;
+        state->dsc.header.flags = 0;
+        state->dsc.header.w = static_cast<uint16_t>(width_);
+        state->dsc.header.h = static_cast<uint16_t>(height_);
+        state->dsc.header.stride = static_cast<uint16_t>(width_ * 2);
+        state->dsc.header.reserved = 0;
+        state->dsc.data = reinterpret_cast<const uint8_t*>(state->buf);
+        state->dsc.data_size = static_cast<uint32_t>(bytes);
+
+        esp_timer_create_args_t timer_args = {};
+        timer_args.callback = OnPreviewTimeout;
+        timer_args.arg = this;
+        timer_args.dispatch_method = ESP_TIMER_TASK;
+        timer_args.name = "photo_preview";
+        if (esp_timer_create(&timer_args, &state->timer) != ESP_OK) {
+            ESP_LOGW(TAG, "preview: timer unavailable, the photo will stay on screen");
+            state->timer = nullptr;
+        }
+
+        preview_ = state.release();
+    }
+
+    const int src_w = src->header.w;
+    const int src_h = src->header.h;
+    const size_t src_stride = src->header.stride != 0 ? src->header.stride : src_w * 2;
+
+    // 屏幕是方的，照片不是：短边铺满、长边居中裁切（cover），不留黑边也不变形
+    int crop_w = src_w;
+    int crop_h = src_h;
+    if (static_cast<int64_t>(src_w) * height_ > static_cast<int64_t>(src_h) * width_) {
+        crop_w = static_cast<int>(static_cast<int64_t>(src_h) * width_ / height_);
+    } else {
+        crop_h = static_cast<int>(static_cast<int64_t>(src_w) * height_ / width_);
+    }
+    const int x0 = (src_w - crop_w) / 2;
+    const int y0 = (src_h - crop_h) / 2;
+
+    for (int y = 0; y < height_; y++) {
+        const int sy = y0 + static_cast<int>(static_cast<int64_t>(y) * crop_h / height_);
+        const uint8_t* row = src->data + static_cast<size_t>(sy) * src_stride;
+        uint16_t* dst = preview_->buf + static_cast<size_t>(y) * width_;
+        for (int x = 0; x < width_; x++) {
+            const int sx = x0 + static_cast<int>(static_cast<int64_t>(x) * crop_w / width_);
+            memcpy(&dst[x], row + static_cast<size_t>(sx) * 2, sizeof(uint16_t));
+        }
+    }
+
+    emote_lock(emote_handle_);
+    gfx_obj_set_pos(preview_->obj, 0, 0);
+    gfx_obj_set_size(preview_->obj, static_cast<uint16_t>(width_),
+                     static_cast<uint16_t>(height_));
+    gfx_img_set_src(preview_->obj, &preview_->dsc);
+    gfx_obj_set_visible(preview_->obj, true);
+    emote_unlock(emote_handle_);
+
+    if (preview_->timer != nullptr) {
+        // 连拍时重新计时，而不是让第一张的计时器提前把第二张收掉
+        esp_timer_stop(preview_->timer);
+        esp_timer_start_once(preview_->timer, static_cast<uint64_t>(kPreviewDurationMs) * 1000);
+    }
+
+    ESP_LOGI(TAG, "preview: %dx%d cover-cropped from %dx%d, shown for %" PRIu32 " ms", width_,
+             height_, src_w, src_h, kPreviewDurationMs);
 }
 
 bool EmoteDisplay::MountAssets(const char* partition_label) {
