@@ -88,7 +88,11 @@ void McpServer::AddCommonTools() {
                     return false;
                 });
     }
+#endif  // HAVE_LVGL — 主题管理器只在 LVGL 显示下存在
 
+    // 摄像头和显示风格无关：emote 动画模式下屏幕不走 LVGL，但摄像头照样在。
+    // 这段原本躺在上面那个 #ifdef 里，换成 emote 显示后 take_photo 就整个消失了，
+    // AI 从此没有拍照能力（于是永远走不到拍完预览这一帧）。
     auto camera = board.GetCamera();
     if (camera) {
         AddTool("self.camera.take_photo",
@@ -114,7 +118,6 @@ void McpServer::AddCommonTools() {
                     return std::move(*result);
                 });
     }
-#endif
 
     // Restore the original tools list to the end of the tools list
     tools_.insert(tools_.end(), std::make_move_iterator(original_tools.begin()),
