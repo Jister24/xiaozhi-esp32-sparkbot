@@ -167,10 +167,16 @@ static emote_handle_t InitializeEmote(const esp_lcd_panel_handle_t panel, const 
 
 // 一张照片要占满屏幕显示几秒，用 gfx 的自定义 image 对象承载：
 // 它和表情走同一条渲染/刷屏链路，不会和渲染任务抢 panel。
+//
+// 双缓冲：局域网图传是连续出帧（约 1~2fps），每帧都要换一张图。如果只留一块缓冲，
+// 写新帧时渲染任务可能正在读旧帧，只能先 visible=false 停一拍——那一拍就会露出
+// 底下的表情，于是屏幕在「摄像头画面 / 表情」之间来回跳。两块缓冲交替用，
+// 写后块、显前块，既不用收起对象也没有撕裂。
 struct EmoteDisplay::PreviewState {
     gfx_obj_t* obj = nullptr;
-    gfx_image_dsc_t dsc = {};
-    uint16_t* buf = nullptr;      // 铺满屏幕后的 RGB565 像素，gfx 直接从这里取
+    gfx_image_dsc_t dsc[2] = {};
+    uint16_t* buf[2] = {nullptr, nullptr};  // 铺满屏幕后的 RGB565 像素，gfx 直接从这里取
+    int front = 0;                          // 当前正在显示的那一块
     esp_timer_handle_t timer = nullptr;
 };
 
@@ -192,8 +198,10 @@ EmoteDisplay::~EmoteDisplay() {
             esp_timer_delete(preview_->timer);
         }
         // 图像对象挂在 display 的子对象链上，emote_deinit 会一并销毁
-        if (preview_->buf != nullptr) {
-            heap_caps_free(preview_->buf);
+        for (auto* b : preview_->buf) {
+            if (b != nullptr) {
+                heap_caps_free(b);
+            }
         }
         delete preview_;
         preview_ = nullptr;
@@ -300,6 +308,8 @@ void EmoteDisplay::HidePreview() {
     emote_lock(emote_handle_);
     gfx_obj_set_visible(preview_->obj, false);
     emote_unlock(emote_handle_);
+    // 图传停掉 5 秒后才会走到这里；流还在的时候这条日志一次都不该出现
+    ESP_LOGI(TAG, "preview: hidden, back to the face");
 }
 
 void EmoteDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
@@ -324,35 +334,41 @@ void EmoteDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     if (preview_ == nullptr) {
         auto state = std::make_unique<PreviewState>();
         const size_t bytes = static_cast<size_t>(width_) * height_ * 2;
-        state->buf = static_cast<uint16_t*>(
-            heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        if (state->buf == nullptr) {
-            state->buf = static_cast<uint16_t*>(heap_caps_malloc(bytes, MALLOC_CAP_8BIT));
-        }
-        if (state->buf == nullptr) {
-            ESP_LOGE(TAG, "preview: no memory for a %dx%d frame (%u bytes)", width_, height_,
-                     static_cast<unsigned>(bytes));
-            return;
+        for (int i = 0; i < 2; i++) {
+            state->buf[i] = static_cast<uint16_t*>(
+                heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            if (state->buf[i] == nullptr) {
+                state->buf[i] = static_cast<uint16_t*>(heap_caps_malloc(bytes, MALLOC_CAP_8BIT));
+            }
+            if (state->buf[i] == nullptr) {
+                ESP_LOGE(TAG, "preview: no memory for a %dx%d frame (%u bytes)", width_, height_,
+                         static_cast<unsigned>(bytes));
+                return;
+            }
         }
 
         state->obj = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_IMAGE, "photo_preview");
         if (state->obj == nullptr) {
             ESP_LOGE(TAG, "preview: failed to create photo_preview object");
-            heap_caps_free(state->buf);
+            for (auto* b : state->buf) {
+                heap_caps_free(b);
+            }
             return;
         }
 
         // 描述符布局和 lv_image_header_t 完全一致，gfx 只认第一个字节的 magic，
         // 数据按行紧凑排布（gfx 的绘制路径固定用 image_width 当 stride）。
-        state->dsc.header.magic = C_ARRAY_HEADER_MAGIC;
-        state->dsc.header.cf = GFX_COLOR_FORMAT_RGB565;
-        state->dsc.header.flags = 0;
-        state->dsc.header.w = static_cast<uint16_t>(width_);
-        state->dsc.header.h = static_cast<uint16_t>(height_);
-        state->dsc.header.stride = static_cast<uint16_t>(width_ * 2);
-        state->dsc.header.reserved = 0;
-        state->dsc.data = reinterpret_cast<const uint8_t*>(state->buf);
-        state->dsc.data_size = static_cast<uint32_t>(bytes);
+        for (int i = 0; i < 2; i++) {
+            state->dsc[i].header.magic = C_ARRAY_HEADER_MAGIC;
+            state->dsc[i].header.cf = GFX_COLOR_FORMAT_RGB565;
+            state->dsc[i].header.flags = 0;
+            state->dsc[i].header.w = static_cast<uint16_t>(width_);
+            state->dsc[i].header.h = static_cast<uint16_t>(height_);
+            state->dsc[i].header.stride = static_cast<uint16_t>(width_ * 2);
+            state->dsc[i].header.reserved = 0;
+            state->dsc[i].data = reinterpret_cast<const uint8_t*>(state->buf[i]);
+            state->dsc[i].data_size = static_cast<uint32_t>(bytes);
+        }
 
         esp_timer_create_args_t timer_args = {};
         timer_args.callback = OnPreviewTimeout;
@@ -382,18 +398,14 @@ void EmoteDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     const int x0 = (src_w - crop_w) / 2;
     const int y0 = (src_h - crop_h) / 2;
 
-    // 上一张还挂着的话先收起：渲染任务随时可能读这块缓冲，
-    // 边写边读会看到半张新、半张旧的撕裂帧。
-    if (gfx_obj_get_visible(preview_->obj)) {
-        emote_lock(emote_handle_);
-        gfx_obj_set_visible(preview_->obj, false);
-        emote_unlock(emote_handle_);
-    }
+    // 写后块、显前块：渲染任务这一帧读的仍是上一块，写和读不会撞在同一片内存上，
+    // 所以既不用「先隐藏再重显」，也不会看到半新半旧的撕裂帧。
+    const int back = preview_->front ^ 1;
 
     for (int y = 0; y < height_; y++) {
         const int sy = y0 + static_cast<int>(static_cast<int64_t>(y) * crop_h / height_);
         const uint8_t* row = src->data + static_cast<size_t>(sy) * src_stride;
-        uint16_t* dst = preview_->buf + static_cast<size_t>(y) * width_;
+        uint16_t* dst = preview_->buf[back] + static_cast<size_t>(y) * width_;
         for (int x = 0; x < width_; x++) {
             const int sx = x0 + static_cast<int>(static_cast<int64_t>(x) * crop_w / width_);
             uint16_t px;
@@ -410,8 +422,11 @@ void EmoteDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     gfx_obj_set_pos(preview_->obj, 0, 0);
     gfx_obj_set_size(preview_->obj, static_cast<uint16_t>(width_),
                      static_cast<uint16_t>(height_));
-    gfx_img_set_src(preview_->obj, &preview_->dsc);
-    gfx_obj_set_visible(preview_->obj, true);
+    gfx_img_set_src(preview_->obj, &preview_->dsc[back]);
+    if (!gfx_obj_get_visible(preview_->obj)) {
+        gfx_obj_set_visible(preview_->obj, true);
+    }
+    preview_->front = back;
     emote_unlock(emote_handle_);
 
     if (preview_->timer != nullptr) {
@@ -420,8 +435,19 @@ void EmoteDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
         esp_timer_start_once(preview_->timer, static_cast<uint64_t>(kPreviewDurationMs) * 1000);
     }
 
-    ESP_LOGI(TAG, "preview: %dx%d cover-cropped from %dx%d, shown for %" PRIu32 " ms", width_,
-             height_, src_w, src_h, kPreviewDurationMs);
+    // 图传连续出帧时这里每秒会调十几次，别刷串口日志；攒够 2 秒汇总一次，
+    // 出问题时能看出「帧在更新」还是「画面冻住了」。
+    static int64_t s_preview_log_us = 0;
+    static uint32_t s_preview_frames = 0;
+    s_preview_frames++;
+    const int64_t now_us = esp_timer_get_time();
+    if (s_preview_log_us == 0 || now_us - s_preview_log_us >= 2000000) {
+        ESP_LOGI(TAG, "preview: %" PRIu32 " frames in %" PRId64 " ms, %dx%d cover-cropped from %dx%d",
+                 s_preview_frames, (now_us - s_preview_log_us) / 1000, width_, height_, src_w,
+                 src_h);
+        s_preview_frames = 0;
+        s_preview_log_us = now_us;
+    }
 }
 
 bool EmoteDisplay::MountAssets(const char* partition_label) {
