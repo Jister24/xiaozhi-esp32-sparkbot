@@ -152,7 +152,8 @@ public:
         if (history_count_ < kHistory) {
             return false;
         }
-        const int oldest = history_[(history_index_ + kHistory - 1) % kHistory];
+        // history_index_ 指向下一个要写入的槽位，也就是 3 分钟前那一个样本
+        const int oldest = history_[history_index_];
         return cell_mv_ - oldest >= 12;
     }
 
