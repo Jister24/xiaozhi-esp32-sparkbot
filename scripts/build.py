@@ -864,6 +864,13 @@ def _collect_variants(
         board_dir = cfg_path.parent
         if board_dir.name == "common":
             continue
+        # 素材包目录（boards/<vendor>/<board>/assets/<分辨率>/config.json）里也有一个
+        # 同名的 config.json，装的是字体、emoji 集合、唤醒词模型这类素材元数据，不是
+        # 板级配置。它会随 EMOTE_EXTERNAL_PATH 打进 assets 分区，名字和位置都不能改。
+        # 不跳过的话，这里会把它当成一个缺 type 字段的板子，整个构建直接抛
+        # "missing non-empty top-level type"。esp-sparkbot 的 240×240 素材就是这样。
+        if "assets" in cfg_path.relative_to(_BOARDS_DIR).parts[:-1]:
+            continue
         board = board_dir.relative_to(_BOARDS_DIR).as_posix()
 
         try:
