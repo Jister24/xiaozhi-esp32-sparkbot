@@ -34,7 +34,7 @@
 需要 **ESP-IDF v6.0.1 以上**（本项目在 `release/v6.1` 上验证）。
 
 ```bash
-git clone git@github.com:Jister24/xiaozhi-esp32-sparkbot.git
+git clone https://github.com/Jister24/xiaozhi-esp32-sparkbot.git
 cd xiaozhi-esp32-sparkbot
 . $IDF_PATH/export.sh
 python scripts/build.py espressif/esp-sparkbot
