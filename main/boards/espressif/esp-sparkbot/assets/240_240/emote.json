@@ -9,6 +9,7 @@
     {"emote": "sad",         "src": "Sad.eaf",       "loop": true,  "fps": 20},
     {"emote": "crying",      "src": "cry.eaf",       "loop": true,  "fps": 20},
     {"emote": "sleepy",      "src": "sleep.eaf",     "loop": true,  "fps": 20},
+    {"emote": "zzz",         "src": "zzz.eaf",       "loop": true,  "fps": 10},
     {"emote": "silly",       "src": "Happy.eaf",     "loop": true,  "fps": 20},
     {"emote": "angry",       "src": "angry.eaf",     "loop": true,  "fps": 20},
     {"emote": "surprised",   "src": "shocked.eaf",   "loop": true,  "fps": 20},

@@ -62,6 +62,11 @@ private:
     struct BatteryBadge;
     void PaintBatteryBadge(int percent, bool charging);
 
+    // SLEEP_ZZZ: 睡觉时飘在左上角的 zzz。不能画进 sleep.eaf——eye_anim 是
+    // mirror=auto，写进去的 z 会被镜像成两份（右边那份还是反的）。
+    struct ZzzOverlay;
+    void UpdateZzzOverlay(bool show);
+
     static void OnPreviewTimeout(void* arg);
     void HidePreview();
 
@@ -72,6 +77,8 @@ private:
     BatteryBadge* badge_ = nullptr;
     int badge_percent_ = -1;    // 上一次画的值，用来跳过无变化的重绘
     bool badge_charging_ = false;
+    ZzzOverlay* zzz_ = nullptr;
+    bool zzz_visible_ = false;
 };
 
 }  // namespace emote

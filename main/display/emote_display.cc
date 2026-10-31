@@ -198,6 +198,21 @@ struct EmoteDisplay::BatteryBadge {
     gfx_image_dsc_t dsc = {};
 };
 
+// ============================================================================
+// SLEEP_ZZZ: 睡觉时左上角的 zzz
+// ============================================================================
+//
+// 为什么单独做一个对象，而不是画进 sleep.eaf：屏幕上那个"脸"只有 eye_anim
+// 一个动画控件，它在 layout.json 里是 mirror=auto——一张 125 宽的图画上去会被
+// 镜像成左右两份。眼睛镜像正好，zzz 镜像就成了两个 z、右边还是反的。
+//
+// 所以 zzz 走 gfx 的自定义 anim 对象，位置自己定。素材是 assets 里的 zzz.eaf
+// （和表情同一个 assets 分区，用 emote_get_asset_data_by_name 取指针，数据在
+// flash 映射区，解码器直接读，不用拷到 RAM）。
+struct EmoteDisplay::ZzzOverlay {
+    gfx_obj_t* obj = nullptr;
+};
+
 namespace {
 
 constexpr int kBadgeW = 57;   // 电池图标 + 三位数字，再多就压到脸了
@@ -245,6 +260,12 @@ constexpr int kDigitPitch = 6;
 constexpr uint8_t kBoltRows[8] = {0x0E, 0x0C, 0x18, 0x1F, 0x06, 0x0C, 0x18, 0x10};
 constexpr int kBoltW = 6;
 constexpr int kBoltH = 8;
+
+// zzz 的落点与帧率，和固件素材里 zzz.eaf 的尺寸（64×56）对应。放左上角是为了
+// 躲开右上角的电量角标（57×20 贴着顶边）。
+constexpr int kZzzX = 8;
+constexpr int kZzzY = 6;
+constexpr int kZzzFps = 10;
 
 }  // namespace
 
@@ -387,6 +408,57 @@ void EmoteDisplay::PaintBatteryBadge(int percent, bool charging) {
     emote_notify_all_refresh(emote_handle_);
 }
 
+void EmoteDisplay::UpdateZzzOverlay(bool show) {
+    if (emote_handle_ == nullptr || show == zzz_visible_) {
+        return;
+    }
+
+    if (zzz_ == nullptr) {
+        if (!show) {
+            return;
+        }
+        const uint8_t* data = nullptr;
+        size_t size = 0;
+        if (!GetAssetData("zzz.eaf", data, size) || size < 24) {
+            // 素材没打进 assets 分区就什么都不建，下次进睡眠再试
+            ESP_LOGW(TAG, "zzz.eaf not found in assets");
+            return;
+        }
+        gfx_obj_t* obj = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_ANIM, "sleep_zzz");
+        if (obj == nullptr) {
+            ESP_LOGW(TAG, "zzz: create object failed");
+            return;
+        }
+        auto* state = new ZzzOverlay();
+        state->obj = obj;
+
+        emote_lock(emote_handle_);
+        // 0xFFFF 表示"放到结尾"，和 emote 组件内部设置表情的写法一致。
+        // 这里只装源不播放，真正显示的时候再 start，每次都是从第一个 z 开始。
+        gfx_anim_set_src(obj, data, size);
+        gfx_anim_set_segment(obj, 0, 0xFFFF, kZzzFps, true);
+        gfx_obj_set_pos(obj, kZzzX, kZzzY);
+        gfx_obj_set_visible(obj, false);
+        emote_unlock(emote_handle_);
+
+        zzz_ = state;
+        ESP_LOGI(TAG, "zzz overlay created (%zu bytes)", size);
+    }
+
+    emote_lock(emote_handle_);
+    if (show) {
+        gfx_anim_start(zzz_->obj);      // 每次醒来再睡都从第一个 z 开始
+    } else {
+        gfx_anim_stop(zzz_->obj);       // 不再出帧，也省掉每秒 10 次的解码
+    }
+    gfx_obj_set_visible(zzz_->obj, show);
+    emote_unlock(emote_handle_);
+
+    zzz_visible_ = show;
+    emote_notify_all_refresh(emote_handle_);
+    ESP_LOGI(TAG, "zzz overlay %s", show ? "shown" : "hidden");
+}
+
 EmoteDisplay::EmoteDisplay(const esp_lcd_panel_handle_t panel,
                            const esp_lcd_panel_io_handle_t panel_io, const int width,
                            const int height)
@@ -400,6 +472,11 @@ EmoteDisplay::EmoteDisplay(const esp_lcd_panel_handle_t panel,
 }
 
 EmoteDisplay::~EmoteDisplay() {
+    if (zzz_ != nullptr) {
+        // gfx 对象由 emote_deinit 一并销毁，这里只回收包装结构
+        delete zzz_;
+        zzz_ = nullptr;
+    }
     if (badge_ != nullptr) {
         // gfx 对象由 emote_deinit 一并销毁，这里只回收像素内存
         heap_caps_free(badge_->rgb);
@@ -439,6 +516,8 @@ bool EmoteDisplay::SetEmotion(const char* const emotion) {
         ESP_LOGW(TAG, "emotion \"%s\" not set: %s", emotion, esp_err_to_name(err));
         return false;
     }
+    // 睡觉时飘 zzz。放在表情切成功之后：切失败时画面还是上一张，zzz 也不该冒出来。
+    UpdateZzzOverlay(std::strcmp(emotion, "sleepy") == 0);
     return true;
 }
 
@@ -463,12 +542,15 @@ void EmoteDisplay::SetStatus(const char* const status) {
     ESP_LOGI(TAG, "SetStatus: %s", status);
     if (emote_handle_ && status && strlen(status) > 0) {
         if (std::strcmp(status, Lang::Strings::LISTENING) == 0) {
+            UpdateZzzOverlay(false);      // 被叫醒了，zzz 先撤
             emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_LISTEN, NULL);
         } else if (std::strcmp(status, Lang::Strings::STANDBY) == 0) {
             emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_IDLE, NULL);
         } else if (std::strcmp(status, Lang::Strings::SPEAKING) == 0) {
+            UpdateZzzOverlay(false);
             emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SPEAK, NULL);
         } else if (std::strcmp(status, Lang::Strings::ERROR) == 0) {
+            UpdateZzzOverlay(false);
             emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SET, NULL);
         }
     }
