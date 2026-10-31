@@ -1,6 +1,7 @@
 #include "application.h"
 #include "button.h"
 #include "codecs/es8311_audio_codec.h"
+#include "chassis_battery.h"
 #include "config.h"
 #include "local_control.h"  // LOCAL_CONTROL_PATCH
 #include "display/lcd_display.h"
@@ -204,6 +205,7 @@ private:
     Display* display_;
     EspVideo* camera_;
     SparkBotBattery battery_;
+    ChassisBattery chassis_battery_;  // 走 UART 问底盘那颗 C2
 #if CONFIG_USE_EMOTE_MESSAGE_STYLE
     emote::EmoteDisplay* emote_display_ = nullptr;  // 电量角标要往它上面推
 #endif
@@ -374,6 +376,7 @@ private:
     // 采样不必很勤：电量本身变化慢，10 秒一次足够，还能让角标跟得上
     void PushBatteryToDisplay() {
 #if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        // 屏幕上只显示本体这一块电池：底盘那颗留给 App，小屏塞两行会看不清
         if (emote_display_ != nullptr && battery_.IsReady()) {
             emote_display_->SetBatteryStatus(battery_.Percent(), battery_.IsCharging());
         }
@@ -381,6 +384,8 @@ private:
     }
 
     void InitializeBattery() {
+        // 底盘电量走 UART，与本体电池互不影响，先起起来（读不到就静默降级）
+        chassis_battery_.Begin();
         if (!battery_.Begin()) {
             return;
         }
@@ -402,15 +407,27 @@ private:
     void InitializeTools() {
         auto& mcp_server = McpServer::GetInstance();
 
-        mcp_server.AddTool("self.battery.get_status", "获取主体板电池电量和电压", PropertyList(),
+        mcp_server.AddTool("self.battery.get_status", "获取电池电量和电压（本体与底盘各一块）",
+                           PropertyList(),
                            [this](const PropertyList& properties) -> ReturnValue {
-                               if (!battery_.IsReady()) {
-                                   return std::string("电池检测不可用");
+                               std::string body;
+                               if (battery_.IsReady()) {
+                                   battery_.Update();
+                                   body = "本体电量 " + std::to_string(battery_.Percent()) +
+                                          "%，电压 " + std::to_string(battery_.CellMillivolts()) +
+                                          " mV";
+                               } else {
+                                   body = "本体电池检测不可用";
                                }
-                               battery_.Update();
-                               return std::string("电量 ") + std::to_string(battery_.Percent()) +
-                                      "%，电压 " + std::to_string(battery_.CellMillivolts()) +
-                                      " mV";
+                               if (chassis_battery_.IsValid()) {
+                                   body += "；底盘电量 " +
+                                           std::to_string(chassis_battery_.Percent()) + "%，电压 " +
+                                           std::to_string(chassis_battery_.Millivolts()) + " mV" +
+                                           (chassis_battery_.IsCharging() ? "（充电中）" : "");
+                               } else {
+                                   body += "；底盘电量读不到";
+                               }
+                               return body;
                            });
 
         // 定义设备的属性
@@ -507,6 +524,15 @@ public:
                               cell_mv = battery_.CellMillivolts();
                               percent = battery_.Percent();
                               charging = battery_.IsCharging();
+                              return true;
+                          },
+                          [this](int& cell_mv, int& percent, bool& charging) {
+                              if (!chassis_battery_.IsValid()) {
+                                  return false;
+                              }
+                              cell_mv = chassis_battery_.Millivolts();
+                              percent = chassis_battery_.Percent();
+                              charging = chassis_battery_.IsCharging();
                               return true;
                           });
 
