@@ -171,14 +171,6 @@ private:
     int history_index_ = 0;
     int history_count_ = 0;
 };
-
-static void BatterySampleTask(void* arg) {
-    auto* battery = static_cast<SparkBotBattery*>(arg);
-    while (true) {
-        battery->Update();
-        vTaskDelay(pdMS_TO_TICKS(5000));
-    }
-}
 // ===== BATTERY END =====
 
 #define TAG "esp_sparkbot"
@@ -212,6 +204,9 @@ private:
     Display* display_;
     EspVideo* camera_;
     SparkBotBattery battery_;
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+    emote::EmoteDisplay* emote_display_ = nullptr;  // 电量角标要往它上面推
+#endif
     light_mode_t light_mode_ = LIGHT_MODE_ALWAYS_ON;
 
     void InitializeI2c() {
@@ -286,7 +281,8 @@ private:
 #if CONFIG_USE_EMOTE_MESSAGE_STYLE
         // EMOTE_STYLE: 表情动画风格。emote 组件直接驱动面板，资源来自 assets 分区里的
         // 240x240 表情包（layout 见 boards/espressif/esp-sparkbot/assets/240_240）。
-        display_ = new emote::EmoteDisplay(panel, panel_io, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+        emote_display_ = new emote::EmoteDisplay(panel, panel_io, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+        display_ = emote_display_;
 #else
         display_ = new SpiLcdDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT,
                                      DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X,
@@ -375,13 +371,32 @@ private:
         ESP_LOGI(TAG, "Sent command: %s", command_str);
     }
 
+    // 采样不必很勤：电量本身变化慢，10 秒一次足够，还能让角标跟得上
+    void PushBatteryToDisplay() {
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        if (emote_display_ != nullptr && battery_.IsReady()) {
+            emote_display_->SetBatteryStatus(battery_.Percent(), battery_.IsCharging());
+        }
+#endif
+    }
+
     void InitializeBattery() {
         if (!battery_.Begin()) {
             return;
         }
-        // 先同步采一次，保证第一个 /status 就有数
+        // 先同步采一次，保证第一个 /status 和角标都有数
         battery_.Update();
-        xTaskCreate(BatterySampleTask, "battery", 3072, &battery_, 2, nullptr);
+        PushBatteryToDisplay();
+        xTaskCreate(
+            [](void* arg) {
+                auto* self = static_cast<EspSparkBot*>(arg);
+                while (true) {
+                    vTaskDelay(pdMS_TO_TICKS(10000));
+                    self->battery_.Update();
+                    self->PushBatteryToDisplay();
+                }
+            },
+            "battery", 3072, this, 2, nullptr);
     }
 
     void InitializeTools() {

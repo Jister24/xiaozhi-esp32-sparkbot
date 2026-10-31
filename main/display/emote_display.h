@@ -40,6 +40,11 @@ public:
     virtual bool GetAssetData(const std::string& name, const uint8_t*& data, size_t& size) override;
     virtual void LoadAssets() override;
 
+    // BATTERY_BADGE: 右上角电量角标。表情每帧重绘，角标挂成 gfx 子对象跟着画，
+    // 带 alpha 掩码所以是透底的，不会在脸上糊一块方块。
+    // 值没变化时直接返回，重复调用是安全的。
+    void SetBatteryStatus(int percent, bool charging);
+
     void RefreshAll();
 
     // Get emote handle for internal use
@@ -52,6 +57,11 @@ private:
     // PHOTO_PREVIEW: 一张照片要占满屏幕显示几秒，用 gfx 的自定义 image 对象承载，
     // 这样它和表情走同一条渲染/刷屏链路，不会和渲染任务抢 panel。
     struct PreviewState;
+
+    // BATTERY_BADGE: 角标的像素缓冲与 gfx 对象
+    struct BatteryBadge;
+    void PaintBatteryBadge(int percent, bool charging);
+
     static void OnPreviewTimeout(void* arg);
     void HidePreview();
 
@@ -59,6 +69,9 @@ private:
     int width_ = 0;
     int height_ = 0;
     PreviewState* preview_ = nullptr;
+    BatteryBadge* badge_ = nullptr;
+    int badge_percent_ = -1;    // 上一次画的值，用来跳过无变化的重绘
+    bool badge_charging_ = false;
 };
 
 }  // namespace emote

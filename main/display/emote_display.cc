@@ -180,6 +180,173 @@ struct EmoteDisplay::PreviewState {
     esp_timer_handle_t timer = nullptr;
 };
 
+// ============================================================================
+// BATTERY_BADGE: 右上角电量角标
+// ============================================================================
+//
+// 和 PHOTO_PREVIEW 同一套路：表情每帧整屏重绘，直接往 panel 上画会被下一帧抹掉，
+// 所以做成 gfx 的 image 子对象挂在显示树上，让渲染任务每帧顺手把它画上去。
+//
+// 区别在格式：这里用 RGB565A8（独立 alpha 平面），角标大部分像素是透明的，
+// 背景透出去，不会在脸上糊一块方块。注意混色路径（gfx_blend_color_mix）会把源
+// 当作**普通小端 RGB565** 处理、自己按 ctx->swap 翻字节，所以缓冲里存未翻转的值；
+// 而不带掩码的 PHOTO_PREVIEW 走裸 memcpy，必须预先翻转——两者正好相反。
+struct EmoteDisplay::BatteryBadge {
+    gfx_obj_t* obj = nullptr;
+    uint16_t* rgb = nullptr;    // 与 alpha 同一块内存，alpha 紧跟其后
+    uint8_t* alpha = nullptr;
+    gfx_image_dsc_t dsc = {};
+};
+
+namespace {
+
+constexpr int kBadgeW = 44;
+constexpr int kBadgeH = 20;
+constexpr int kBadgeMargin = 5;
+
+uint16_t PackRgb565(uint8_t r, uint8_t g, uint8_t b) {
+    return static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
+// 圆角矩形命中测试：四角按圆心距离算，中间直接放行
+bool InRoundedRect(int x, int y, int x0, int y0, int x1, int y1, int radius) {
+    if (x < x0 || x > x1 || y < y0 || y > y1) {
+        return false;
+    }
+    const int cx = x < x0 + radius ? x0 + radius : (x > x1 - radius ? x1 - radius : x);
+    const int cy = y < y0 + radius ? y0 + radius : (y > y1 - radius ? y1 - radius : y);
+    const int dx = x - cx;
+    const int dy = y - cy;
+    return dx * dx + dy * dy <= radius * radius;
+}
+
+// 充电时叠在电量上的小闪电，7×8，bit6 是最左边一列
+constexpr uint8_t kBoltRows[8] = {0x38, 0x30, 0x60, 0x7C, 0x18, 0x30, 0x60, 0x40};
+constexpr int kBoltW = 7;
+constexpr int kBoltH = 8;
+
+}  // namespace
+
+void EmoteDisplay::SetBatteryStatus(int percent, bool charging) {
+    if (emote_handle_ == nullptr || width_ <= 0) {
+        return;
+    }
+    const int clamped = percent < 0 ? 0 : (percent > 100 ? 100 : percent);
+    if (badge_ != nullptr && clamped == badge_percent_ && charging == badge_charging_) {
+        return;
+    }
+    badge_percent_ = clamped;
+    badge_charging_ = charging;
+    PaintBatteryBadge(clamped, charging);
+}
+
+void EmoteDisplay::PaintBatteryBadge(int percent, bool charging) {
+    if (badge_ == nullptr) {
+        const size_t rgb_bytes = static_cast<size_t>(kBadgeW) * kBadgeH * 2;
+        const size_t alpha_bytes = static_cast<size_t>(kBadgeW) * kBadgeH;
+        auto* state = new BatteryBadge();
+        uint8_t* mem = static_cast<uint8_t*>(
+            heap_caps_malloc(rgb_bytes + alpha_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (mem == nullptr) {
+            mem = static_cast<uint8_t*>(heap_caps_malloc(rgb_bytes + alpha_bytes, MALLOC_CAP_8BIT));
+        }
+        state->obj = mem != nullptr
+                         ? emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_IMAGE, "battery_badge")
+                         : nullptr;
+        if (state->obj == nullptr) {
+            // 资源区还没挂好或内存不够都会走到这里，下次调用再试
+            ESP_LOGW(TAG, "battery badge: create failed, retry later");
+            heap_caps_free(mem);
+            delete state;
+            badge_percent_ = -1;
+            return;
+        }
+        state->rgb = reinterpret_cast<uint16_t*>(mem);
+        state->alpha = mem + rgb_bytes;
+
+        state->dsc.header.magic = C_ARRAY_HEADER_MAGIC;
+        state->dsc.header.cf = GFX_COLOR_FORMAT_RGB565A8;
+        state->dsc.header.flags = 0;
+        state->dsc.header.w = kBadgeW;
+        state->dsc.header.h = kBadgeH;
+        state->dsc.header.stride = kBadgeW * 2;
+        state->dsc.header.reserved = 0;
+        state->dsc.data = mem;
+        state->dsc.data_size = static_cast<uint32_t>(rgb_bytes + alpha_bytes);
+        badge_ = state;
+    }
+
+    const uint16_t white = PackRgb565(255, 255, 255);
+    const uint16_t level_color = percent <= 20 ? PackRgb565(255, 59, 48)
+                                               : (percent <= 50 ? PackRgb565(255, 179, 0)
+                                                                : PackRgb565(76, 217, 100));
+
+    constexpr int kFillX0 = 5;
+    constexpr int kFillX1 = 34;
+    constexpr int kFillSpan = kFillX1 - kFillX0 + 1;
+    int filled = kFillSpan * percent / 100;
+    if (percent > 0 && filled == 0) {
+        filled = 1;  // 只要还有电，就留一格，别显示成空壳
+    }
+
+    for (int y = 0; y < kBadgeH; y++) {
+        for (int x = 0; x < kBadgeW; x++) {
+            uint16_t color = 0;
+            uint8_t alpha = 0;
+            // 黑色半透明底衬：保证在亮色表情上也看得清
+            if (InRoundedRect(x, y, 0, 0, kBadgeW - 1, kBadgeH - 1, 7)) {
+                alpha = 70;
+            }
+            // 电池外壳与内腔
+            if (InRoundedRect(x, y, 2, 2, 37, 17, 5)) {
+                if (!InRoundedRect(x, y, 4, 4, 35, 15, 4)) {
+                    color = white;
+                    alpha = 235;
+                } else if (x >= kFillX0 && x < kFillX0 + filled) {
+                    color = level_color;
+                    alpha = 240;
+                } else {
+                    alpha = 0;  // 空的那一截透出底衬
+                }
+            }
+            // 正极触点
+            if (x >= 39 && x <= 42 && y >= 7 && y <= 12) {
+                color = white;
+                alpha = 235;
+            }
+            const int i = y * kBadgeW + x;
+            badge_->rgb[i] = color;
+            badge_->alpha[i] = alpha;
+        }
+    }
+
+    if (charging) {
+        constexpr int kX = 16;
+        constexpr int kY = 5;
+        for (int row = 0; row < kBoltH; row++) {
+            for (int col = 0; col < kBoltW; col++) {
+                if ((kBoltRows[row] >> (kBoltW - 1 - col)) & 1) {
+                    const int i = (kY + row) * kBadgeW + (kX + col);
+                    badge_->rgb[i] = white;
+                    badge_->alpha[i] = 245;
+                }
+            }
+        }
+    }
+
+    emote_lock(emote_handle_);
+    gfx_obj_set_pos(badge_->obj, width_ - kBadgeW - kBadgeMargin, kBadgeMargin);
+    gfx_obj_set_size(badge_->obj, kBadgeW, kBadgeH);
+    gfx_img_set_src(badge_->obj, &badge_->dsc);
+    if (!gfx_obj_get_visible(badge_->obj)) {
+        gfx_obj_set_visible(badge_->obj, true);
+    }
+    emote_unlock(emote_handle_);
+
+    // 表情静止时渲染任务可能不再出帧，主动催一帧，否则角标要等到下次动图才更新
+    emote_notify_all_refresh(emote_handle_);
+}
+
 EmoteDisplay::EmoteDisplay(const esp_lcd_panel_handle_t panel,
                            const esp_lcd_panel_io_handle_t panel_io, const int width,
                            const int height)
@@ -193,6 +360,12 @@ EmoteDisplay::EmoteDisplay(const esp_lcd_panel_handle_t panel,
 }
 
 EmoteDisplay::~EmoteDisplay() {
+    if (badge_ != nullptr) {
+        // gfx 对象由 emote_deinit 一并销毁，这里只回收像素内存
+        heap_caps_free(badge_->rgb);
+        delete badge_;
+        badge_ = nullptr;
+    }
     if (preview_ != nullptr) {
         if (preview_->timer != nullptr) {
             esp_timer_delete(preview_->timer);
