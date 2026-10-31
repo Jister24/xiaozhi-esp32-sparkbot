@@ -200,12 +200,16 @@ struct EmoteDisplay::BatteryBadge {
 
 namespace {
 
-constexpr int kBadgeW = 44;
+constexpr int kBadgeW = 57;   // 电池图标 + 三位数字，再多就压到脸了
 constexpr int kBadgeH = 20;
 constexpr int kBadgeMargin = 5;
 
+// 混色时 gfx_blend_color_mix 会把 src 和 dest 都按 swap 翻一遍算完再翻回来，
+// 而帧缓冲里的 dest 本身就是翻转过的，所以 src 也必须给翻转后的值，
+// 否则只有白色（0xFFFF 翻转后还是自己）正常，彩色会串成粉/褐色。
 uint16_t PackRgb565(uint8_t r, uint8_t g, uint8_t b) {
-    return static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+    const uint16_t v = static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+    return static_cast<uint16_t>((v >> 8) | (v << 8));
 }
 
 // 圆角矩形命中测试：四角按圆心距离算，中间直接放行
@@ -220,9 +224,26 @@ bool InRoundedRect(int x, int y, int x0, int y0, int x1, int y1, int radius) {
     return dx * dx + dy * dy <= radius * radius;
 }
 
-// 充电时叠在电量上的小闪电，7×8，bit6 是最左边一列
-constexpr uint8_t kBoltRows[8] = {0x38, 0x30, 0x60, 0x7C, 0x18, 0x30, 0x60, 0x40};
-constexpr int kBoltW = 7;
+// 5×7 点阵数字，bit4 是最左边一列。为这点字引一套字体不划算，直接画。
+constexpr uint8_t kDigitFont[10][7] = {
+    {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E},  // 0
+    {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E},  // 1
+    {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F},  // 2
+    {0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E},  // 3
+    {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02},  // 4
+    {0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E},  // 5
+    {0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E},  // 6
+    {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08},  // 7
+    {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E},  // 8
+    {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C},  // 9
+};
+constexpr int kDigitW = 5;
+constexpr int kDigitH = 7;
+constexpr int kDigitPitch = 6;
+
+// 充电时叠在电量上的小闪电，6×8，bit5 是最左边一列
+constexpr uint8_t kBoltRows[8] = {0x0E, 0x0C, 0x18, 0x1F, 0x06, 0x0C, 0x18, 0x10};
+constexpr int kBoltW = 6;
 constexpr int kBoltH = 8;
 
 }  // namespace
@@ -281,8 +302,9 @@ void EmoteDisplay::PaintBatteryBadge(int percent, bool charging) {
                                                : (percent <= 50 ? PackRgb565(255, 179, 0)
                                                                 : PackRgb565(76, 217, 100));
 
+    // 电池图标占左半，数字右对齐占右半：0..53 宽，图标 2..33，数字贴到 52
     constexpr int kFillX0 = 5;
-    constexpr int kFillX1 = 34;
+    constexpr int kFillX1 = 27;
     constexpr int kFillSpan = kFillX1 - kFillX0 + 1;
     int filled = kFillSpan * percent / 100;
     if (percent > 0 && filled == 0) {
@@ -293,24 +315,22 @@ void EmoteDisplay::PaintBatteryBadge(int percent, bool charging) {
         for (int x = 0; x < kBadgeW; x++) {
             uint16_t color = 0;
             uint8_t alpha = 0;
-            // 黑色半透明底衬：保证在亮色表情上也看得清
+            // 底衬打底：黑色半透明，保证在亮色表情上也看得清
             if (InRoundedRect(x, y, 0, 0, kBadgeW - 1, kBadgeH - 1, 7)) {
                 alpha = 70;
             }
-            // 电池外壳与内腔
-            if (InRoundedRect(x, y, 2, 2, 37, 17, 5)) {
-                if (!InRoundedRect(x, y, 4, 4, 35, 15, 4)) {
-                    color = white;
-                    alpha = 235;
-                } else if (x >= kFillX0 && x < kFillX0 + filled) {
-                    color = level_color;
-                    alpha = 240;
-                } else {
-                    alpha = 0;  // 空的那一截透出底衬
-                }
+            const bool in_outer = InRoundedRect(x, y, 2, 3, 30, 16, 3);
+            const bool in_inner = InRoundedRect(x, y, 4, 5, 28, 14, 2);
+            if (in_outer && !in_inner) {
+                // 2px 外壳
+                color = white;
+                alpha = 235;
+            } else if (in_inner && x >= kFillX0 && x < kFillX0 + filled) {
+                color = level_color;
+                alpha = 240;
             }
-            // 正极触点
-            if (x >= 39 && x <= 42 && y >= 7 && y <= 12) {
+            // 内腔里没填到的部分不画，留着底衬，别把 alpha 抹成 0
+            if (x >= 31 && x <= 33 && y >= 7 && y <= 12) {
                 color = white;
                 alpha = 235;
             }
@@ -320,9 +340,29 @@ void EmoteDisplay::PaintBatteryBadge(int percent, bool charging) {
         }
     }
 
+    // 百分比数字：不加 % 号，电池图标已经说明这是电量，数字右对齐好比较
+    const int digits = percent >= 100 ? 3 : (percent >= 10 ? 2 : 1);
+    const int text_x = 54 - digits * kDigitPitch;  // 三个数字右边缘统一停在 52
+    int value = percent;
+    for (int d = digits - 1; d >= 0; d--) {
+        const int glyph = value % 10;
+        value /= 10;
+        const int cx = text_x + d * kDigitPitch;
+        for (int row = 0; row < kDigitH; row++) {
+            const uint8_t bits = kDigitFont[glyph][row];
+            for (int col = 0; col < kDigitW; col++) {
+                if ((bits >> (kDigitW - 1 - col)) & 1) {
+                    const int i = (6 + row) * kBadgeW + (cx + col);
+                    badge_->rgb[i] = white;
+                    badge_->alpha[i] = 245;
+                }
+            }
+        }
+    }
+
     if (charging) {
-        constexpr int kX = 16;
-        constexpr int kY = 5;
+        constexpr int kX = 11;
+        constexpr int kY = 6;
         for (int row = 0; row < kBoltH; row++) {
             for (int col = 0; col < kBoltW; col++) {
                 if ((kBoltRows[row] >> (kBoltW - 1 - col)) & 1) {
