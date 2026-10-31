@@ -18,6 +18,71 @@
 
 #include "esp_video.h"
 
+// BATTERY_PROBE: 临时探针。主体板上电池（2000mAh）是否有分压接到 S3 的 ADC，
+// 官方原理图（立创 oshwhub）抓不到、官方固件也没有读电池的代码，只能用实测判定。
+// 主体已被占用的 GPIO 见 config.h，空闲的只有 1/2/3/14/19/20，其中 19/20 是 USB，
+// 14 属 ADC2（Wi-Fi 开启时不可用），故只扫 GPIO1/2/3（ADC1 的 CH0/CH1/CH2）。
+#include <esp_adc/adc_cali.h>
+#include <esp_adc/adc_cali_scheme.h>
+#include <esp_adc/adc_oneshot.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+static void BatteryProbeTask(void*) {
+    adc_oneshot_unit_handle_t unit = nullptr;
+    adc_oneshot_unit_init_cfg_t unit_cfg = {};
+    unit_cfg.unit_id = ADC_UNIT_1;
+    unit_cfg.ulp_mode = ADC_ULP_MODE_DISABLE;
+    if (adc_oneshot_new_unit(&unit_cfg, &unit) != ESP_OK) {
+        ESP_LOGE("BATPROBE", "adc unit 创建失败");
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    adc_oneshot_chan_cfg_t chan_cfg = {};
+    chan_cfg.atten = ADC_ATTEN_DB_12;       // 量程约 0~3.1V
+    chan_cfg.bitwidth = ADC_BITWIDTH_DEFAULT;
+
+    const adc_channel_t channels[] = {ADC_CHANNEL_0, ADC_CHANNEL_1, ADC_CHANNEL_2};
+    const char* names[] = {"GPIO1", "GPIO2", "GPIO3"};
+    for (int i = 0; i < 3; i++) {
+        adc_oneshot_config_channel(unit, channels[i], &chan_cfg);
+    }
+
+    adc_cali_handle_t cali = nullptr;
+    adc_cali_curve_fitting_config_t cali_cfg = {};
+    cali_cfg.unit_id = ADC_UNIT_1;
+    cali_cfg.atten = ADC_ATTEN_DB_12;
+    cali_cfg.bitwidth = ADC_BITWIDTH_DEFAULT;
+    bool cali_ok = (adc_cali_create_scheme_curve_fitting(&cali_cfg, &cali) == ESP_OK);
+
+    ESP_LOGW("BATPROBE", "开始扫描，cali=%d", (int)cali_ok);
+    while (true) {
+        for (int i = 0; i < 3; i++) {
+            int lo = 4095, hi = 0, sum = 0;
+            for (int n = 0; n < 16; n++) {
+                int raw = 0;
+                if (adc_oneshot_read(unit, channels[i], &raw) != ESP_OK) continue;
+                sum += raw;
+                if (raw < lo) lo = raw;
+                if (raw > hi) hi = raw;
+            }
+            int avg = sum / 16;
+            int mv = 0;
+            if (cali_ok) adc_cali_raw_to_voltage(cali, avg, &mv);
+            // 悬空引脚：读数接近 0 或来回漂移（max-min 很大）；接了分压：稳定在 1.0~2.2V
+            ESP_LOGW("BATPROBE", "%s raw=%d (min=%d max=%d 抖动=%d) -> %d mV",
+                     names[i], avg, lo, hi, hi - lo, mv);
+        }
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+static void BatteryProbeStart() {
+    xTaskCreate(BatteryProbeTask, "bat_probe", 3072, nullptr, 3, nullptr);
+}
+// ===== BATTERY_PROBE END =====
+
 #define TAG "esp_sparkbot"
 
 class SparkBotEs8311AudioCodec : public Es8311AudioCodec {
@@ -300,6 +365,7 @@ public:
         // lambda 捕获 this 以复用 private 的 SendUartMessage，无需开放可见性。
         LocalControlStart([this](const char* cmd) { SendUartMessage(cmd); });
         GetBacklight()->RestoreBrightness();
+        BatteryProbeStart();  // BATTERY_PROBE
     }
 
     virtual AudioCodec* GetAudioCodec() override {
