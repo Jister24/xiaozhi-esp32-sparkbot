@@ -23,3 +23,8 @@ using BatteryProvider = std::function<bool(int& cell_mv, int& percent, bool& cha
 void LocalControlStart(std::function<void(const char*)> send_command,
                        BatteryProvider battery_provider = nullptr,
                        BatteryProvider chassis_battery_provider = nullptr);
+
+// 当前是否处在 Wi-Fi 省电状态，也就是「没有远程客户端在用的空闲期」。
+// 板级据此在屏幕上换成睡觉表情（见 esp_sparkbot_board.cc 的 UpdateSleepFace），
+// 有请求进来的一瞬间就会变回 false，脸也跟着醒。
+bool LocalControlPowerSaveOn();

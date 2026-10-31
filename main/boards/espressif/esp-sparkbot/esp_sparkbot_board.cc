@@ -210,6 +210,7 @@ private:
     emote::EmoteDisplay* emote_display_ = nullptr;  // 电量角标要往它上面推
 #endif
     light_mode_t light_mode_ = LIGHT_MODE_ALWAYS_ON;
+    bool sleep_face_on_ = false;  // 低功耗时是否已经把脸换成睡觉
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -404,6 +405,39 @@ private:
             "battery", 3072, this, 2, nullptr);
     }
 
+    // 低功耗（Wi-Fi 省电开着，也就是没有远程客户端在用）并且设备空闲时，
+    // 屏上换成睡觉表情；有客户端活动、或者开始对话，就换回中立。
+    // 两个条件分别来自 local_control 的省电调度和 Application 的设备状态：
+    // 只看省电状态的话，对着机器人说话时它还在睡；只看设备状态的话，
+    // 手机上遥控时会睡着——都不对，必须同时满足。
+    void UpdateSleepFace() {
+        if (display_ == nullptr) {
+            return;
+        }
+        const bool want = LocalControlPowerSaveOn() &&
+                          Application::GetInstance().GetDeviceState() == kDeviceStateIdle;
+        if (want == sleep_face_on_) {
+            return;
+        }
+        sleep_face_on_ = want;
+        display_->SetEmotion(want ? "sleepy" : "neutral");
+    }
+
+    void StartSleepFaceTask() {
+        xTaskCreate(
+            [](void* arg) {
+                auto* self = static_cast<EspSparkBot*>(arg);
+                // 板级是在 Application 单例的构造函数里造出来的，这时候它的
+                // GetDeviceState 还不能问，先等单例构造完再开始轮询。
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                while (true) {
+                    self->UpdateSleepFace();
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                }
+            },
+            "sleep_face", 4096, this, 2, nullptr);
+    }
+
     void InitializeTools() {
         auto& mcp_server = McpServer::GetInstance();
 
@@ -535,6 +569,8 @@ public:
                               charging = chassis_battery_.IsCharging();
                               return true;
                           });
+
+        StartSleepFaceTask();  // 低功耗时打睡脸，见 UpdateSleepFace
 
         GetBacklight()->RestoreBrightness();
     }

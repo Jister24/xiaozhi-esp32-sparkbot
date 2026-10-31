@@ -582,6 +582,13 @@ void BootstrapTask(void*) {
 
 }  // namespace
 
+// 板级要判断「现在是不是低功耗」，所以把状态开放出去。
+// g_ps_active 只在省电与否切换时改写，读一个 bool 不会撕裂；读到旧值最多让
+// 睡脸晚 500ms 出现或消失，无所谓。
+bool LocalControlPowerSaveOn() {
+    return !g_ps_active;
+}
+
 void LocalControlStart(std::function<void(const char*)> send_command,
                        BatteryProvider battery_provider,
                        BatteryProvider chassis_battery_provider) {
