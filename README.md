@@ -37,19 +37,35 @@
 git clone git@github.com:Jister24/xiaozhi-esp32-sparkbot.git
 cd xiaozhi-esp32-sparkbot
 . $IDF_PATH/export.sh
-
-# 标准方式
 python scripts/build.py espressif/esp-sparkbot
+```
 
-# 或直接走 idf.py（目标必须显式给，否则只会编通用代码，不编板级）
-idf.py -DIDF_TARGET=esp32s3 -DBOARD_NAME=esp-sparkbot build
+产物是 `build/merged-binary.bin`（bootloader + 分区表 + 应用 + 素材，可直接烧 `0x0`）：
+
+```bash
 idf.py -p /dev/cu.usbmodem* flash monitor
+```
+
+**别用裸 `idf.py build`。** 板型由 `CONFIG_BOARD_TYPE_ESP_SPARKBOT` 这个 Kconfig 宏决定，
+它是 `scripts/build.py` 从板级 `config.json` 的 `sdkconfig_append` 合并进 sdkconfig 的；
+`-DBOARD_NAME=` 只对 build.py 有意义，CMake 不认。直接 `idf.py build` 会编出一个
+**没有任何板型**的固件：照样打印 build complete、照样出 `xiaozhi.bin`，但
+`boards/espressif/esp-sparkbot/` 下一个 `.obj` 都没有，烧进去还是老固件。
+
+想确认没白编，看这四行都存在：
+
+```bash
+find build -name 'esp_sparkbot_board.cc.obj' -o -name 'local_control.cc.obj' \
+           -o -name 'chassis_battery.cc.obj' -o -name 'emote_display.cc.obj'
 ```
 
 ## 踩过的坑
 
-- **必须显式 `-DIDF_TARGET=esp32s3`**。缺了它 `idf.py` 也会报「编译成功」，但板级 `.obj`
-  一个都没编，烧进去还是老固件。
+- **`scripts/build.py` 会误吞素材目录的 `config.json`**。它用 `rglob('config.json')` 扫
+  `main/boards/`，只跳过 `common`，于是把 `assets/240_240/config.json`（装字体、emoji
+  集合、唤醒词模型的素材元数据）当成板级配置，报 `missing non-empty top-level "type"`，
+  构建在收集变体阶段就挂。本仓已改成按路径跳过 `assets/`；如果你把改动 rebase 到新上游，
+  记得把这处补回来。
 - `CONFIG_MMAP_FILE_NAME_LENGTH` 必须 ≥ 32（默认 16）。否则 `font_puhui_common_16_4.bin`
   这种长名字会被截断，字体静默加载失败、不报错。已在板级 `config.json` 的
   `sdkconfig_append` 里固定。
