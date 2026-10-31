@@ -3,6 +3,7 @@
 
 #include <driver/gpio.h>
 #include <driver/uart.h>
+#include <esp_adc/adc_oneshot.h>
 
 #define AUDIO_INPUT_SAMPLE_RATE  16000
 #define AUDIO_OUTPUT_SAMPLE_RATE 16000
@@ -54,6 +55,16 @@
 #define ECHO_UART_PORT_NUM      UART_NUM_1
 #define ECHO_UART_BAUD_RATE     (115200)
 #define BUF_SIZE                (1024)
+
+/* 主体板电池检测
+ * 官方固件不读电池，原理图也没公开，靠实测确定：GPIO14（ADC2_CH3）是唯一
+ * 电压稳定、且随电池变化的引脚（满电实测 2084 mV，抖动 <10 mV）。
+ * 按两个 100k 等值电阻分压还原，电芯 = 引脚电压 × 2。
+ * 注意 ADC2 在 ESP32 上会与 Wi-Fi 冲突，S3 上实测不会，所以不必在 Wi-Fi 前采样。 */
+#define BATTERY_ADC_UNIT          ADC_UNIT_2
+#define BATTERY_ADC_CHANNEL       ADC_CHANNEL_3
+#define BATTERY_UPPER_RESISTOR    (100000.0f)
+#define BATTERY_LOWER_RESISTOR    (100000.0f)
 
 typedef enum {
     LIGHT_MODE_CHARGING_BREATH = 0,

@@ -18,70 +18,167 @@
 
 #include "esp_video.h"
 
-// BATTERY_PROBE: 临时探针。主体板上电池（2000mAh）是否有分压接到 S3 的 ADC，
-// 官方原理图（立创 oshwhub）抓不到、官方固件也没有读电池的代码，只能用实测判定。
-// 主体已被占用的 GPIO 见 config.h，空闲的只有 1/2/3/14/19/20，其中 19/20 是 USB，
-// 14 属 ADC2（Wi-Fi 开启时不可用），故只扫 GPIO1/2/3（ADC1 的 CH0/CH1/CH2）。
 #include <esp_adc/adc_cali.h>
 #include <esp_adc/adc_cali_scheme.h>
 #include <esp_adc/adc_oneshot.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-static void BatteryProbeTask(void*) {
-    adc_oneshot_unit_handle_t unit = nullptr;
-    adc_oneshot_unit_init_cfg_t unit_cfg = {};
-    unit_cfg.unit_id = ADC_UNIT_1;
-    unit_cfg.ulp_mode = ADC_ULP_MODE_DISABLE;
-    if (adc_oneshot_new_unit(&unit_cfg, &unit) != ESP_OK) {
-        ESP_LOGE("BATPROBE", "adc unit 创建失败");
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    adc_oneshot_chan_cfg_t chan_cfg = {};
-    chan_cfg.atten = ADC_ATTEN_DB_12;       // 量程约 0~3.1V
-    chan_cfg.bitwidth = ADC_BITWIDTH_DEFAULT;
-
-    const adc_channel_t channels[] = {ADC_CHANNEL_0, ADC_CHANNEL_1, ADC_CHANNEL_2};
-    const char* names[] = {"GPIO1", "GPIO2", "GPIO3"};
-    for (int i = 0; i < 3; i++) {
-        adc_oneshot_config_channel(unit, channels[i], &chan_cfg);
-    }
-
-    adc_cali_handle_t cali = nullptr;
-    adc_cali_curve_fitting_config_t cali_cfg = {};
-    cali_cfg.unit_id = ADC_UNIT_1;
-    cali_cfg.atten = ADC_ATTEN_DB_12;
-    cali_cfg.bitwidth = ADC_BITWIDTH_DEFAULT;
-    bool cali_ok = (adc_cali_create_scheme_curve_fitting(&cali_cfg, &cali) == ESP_OK);
-
-    ESP_LOGW("BATPROBE", "开始扫描，cali=%d", (int)cali_ok);
-    while (true) {
-        for (int i = 0; i < 3; i++) {
-            int lo = 4095, hi = 0, sum = 0;
-            for (int n = 0; n < 16; n++) {
-                int raw = 0;
-                if (adc_oneshot_read(unit, channels[i], &raw) != ESP_OK) continue;
-                sum += raw;
-                if (raw < lo) lo = raw;
-                if (raw > hi) hi = raw;
-            }
-            int avg = sum / 16;
-            int mv = 0;
-            if (cali_ok) adc_cali_raw_to_voltage(cali, avg, &mv);
-            // 悬空引脚：读数接近 0 或来回漂移（max-min 很大）；接了分压：稳定在 1.0~2.2V
-            ESP_LOGW("BATPROBE", "%s raw=%d (min=%d max=%d 抖动=%d) -> %d mV",
-                     names[i], avg, lo, hi, hi - lo, mv);
+// ===========================================================================
+// 电池检测（主体板）
+//
+// 官方固件不读电池、原理图未公开，引脚是实测扫出来的：把 ADC1/ADC2 所有空闲
+// 通道逐个采样，只有 GPIO14（ADC2_CH3）读数稳定且量级像电池分压——
+// 满电插 USB 时引脚 2084 mV、抖动 <10 mV，按等值电阻分压还原即 4.17 V。
+// 其余空闲脚要么恒为 0，要么抖动上百 LSB（悬空）。I2C 上也只有 ES8311 与
+// BMI270，没有 IP5306 / MAX17048 之类的电量计。
+//
+// 充电状态没有引到 S3（底盘侧的 C2 才知道自己那块电池在不在充），所以这里
+// 只能靠电压趋势做启发式判断：连续 3 分钟电压抬升或逼近满电即认为在充电。
+// ===========================================================================
+class SparkBotBattery {
+public:
+    bool Begin() {
+        adc_oneshot_unit_init_cfg_t unit_cfg = {};
+        unit_cfg.unit_id = BATTERY_ADC_UNIT;
+        unit_cfg.ulp_mode = ADC_ULP_MODE_DISABLE;
+        esp_err_t err = adc_oneshot_new_unit(&unit_cfg, &unit_);
+        if (err != ESP_OK) {
+            ESP_LOGE(kTag, "ADC 单元创建失败: %s", esp_err_to_name(err));
+            return false;
         }
+
+        adc_oneshot_chan_cfg_t chan_cfg = {};
+        chan_cfg.atten = ADC_ATTEN_DB_12;
+        chan_cfg.bitwidth = ADC_BITWIDTH_DEFAULT;
+        err = adc_oneshot_config_channel(unit_, BATTERY_ADC_CHANNEL, &chan_cfg);
+        if (err != ESP_OK) {
+            ESP_LOGE(kTag, "ADC 通道配置失败: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        // 曲线拟合校准：没有校准表也能出数，只是绝对精度差几十 mV，
+        // 对电量百分比影响不大，所以失败不致命。
+        adc_cali_curve_fitting_config_t cali_cfg = {};
+        cali_cfg.unit_id = BATTERY_ADC_UNIT;
+        cali_cfg.atten = ADC_ATTEN_DB_12;
+        cali_cfg.bitwidth = ADC_BITWIDTH_DEFAULT;
+        if (adc_cali_create_scheme_curve_fitting(&cali_cfg, &cali_) != ESP_OK) {
+            cali_ = nullptr;
+        }
+
+        ready_ = true;
+        ESP_LOGI(kTag, "电池检测就绪，cali=%d", cali_ != nullptr);
+        return true;
+    }
+
+    bool IsReady() const { return ready_; }
+
+    // 采样一次并更新平滑值。16 次取平均可以把 ±5 LSB 的抖动压到 1 LSB 量级。
+    void Update() {
+        if (!ready_) {
+            return;
+        }
+        int sum = 0;
+        int ok = 0;
+        for (int i = 0; i < kSamples; i++) {
+            int raw = 0;
+            if (adc_oneshot_read(unit_, BATTERY_ADC_CHANNEL, &raw) != ESP_OK) {
+                continue;
+            }
+            sum += raw;
+            ok++;
+        }
+        if (ok == 0) {
+            return;
+        }
+        int pin_mv = sum / ok;
+        if (cali_ != nullptr) {
+            int mv = 0;
+            if (adc_cali_raw_to_voltage(cali_, sum / ok, &mv) == ESP_OK) {
+                pin_mv = mv;
+            }
+        }
+        const float cell = pin_mv * (BATTERY_UPPER_RESISTOR + BATTERY_LOWER_RESISTOR) /
+                           BATTERY_LOWER_RESISTOR;
+        // 一阶低通：充电/放电都慢，没必要让显示跟着负载跳。
+        cell_mv_ = (cell_mv_ <= 0) ? static_cast<int>(cell)
+                                   : static_cast<int>(cell_mv_ * 0.7f + cell * 0.3f);
+
+        history_[history_index_] = cell_mv_;
+        history_index_ = (history_index_ + 1) % kHistory;
+        if (history_count_ < kHistory) {
+            history_count_++;
+        }
+    }
+
+    int CellMillivolts() const { return cell_mv_; }
+
+    int Percent() const {
+        if (cell_mv_ <= 0) {
+            return 0;
+        }
+        // 锂电开路电压 → 剩余电量，取自 adc_battery_estimation 的默认曲线
+        static const struct {
+            int mv;
+            int pct;
+        } kOcv[] = {
+            {4160, 100}, {4070, 90}, {3990, 80}, {3900, 70}, {3820, 60}, {3720, 50},
+            {3610, 40},  {3530, 30}, {3380, 20}, {3200, 10}, {2850, 0},
+        };
+        constexpr int kCount = sizeof(kOcv) / sizeof(kOcv[0]);
+        if (cell_mv_ >= kOcv[0].mv) {
+            return 100;
+        }
+        for (int i = 0; i < kCount - 1; i++) {
+            if (cell_mv_ <= kOcv[i].mv && cell_mv_ >= kOcv[i + 1].mv) {
+                const int dv = kOcv[i].mv - kOcv[i + 1].mv;
+                const int dp = kOcv[i].pct - kOcv[i + 1].pct;
+                return kOcv[i + 1].pct + (cell_mv_ - kOcv[i + 1].mv) * dp / dv;
+            }
+        }
+        return 0;
+    }
+
+    // 纯启发式：插着 USB 时电压会被充电电路顶高，3 分钟内上涨超过 12 mV，
+    // 或已经贴在满电电压上，就认为在充电。拔掉后电压回落即判定为放电。
+    bool IsCharging() const {
+        if (cell_mv_ <= 0) {
+            return false;
+        }
+        if (cell_mv_ >= kFullMv - 10) {
+            return true;
+        }
+        if (history_count_ < kHistory) {
+            return false;
+        }
+        const int oldest = history_[(history_index_ + kHistory - 1) % kHistory];
+        return cell_mv_ - oldest >= 12;
+    }
+
+private:
+    static constexpr const char* kTag = "sparkbot_batt";
+    static constexpr int kSamples = 16;
+    static constexpr int kHistory = 36;  // 5s × 36 = 3 分钟
+    static constexpr int kFullMv = 4160;
+
+    adc_oneshot_unit_handle_t unit_ = nullptr;
+    adc_cali_handle_t cali_ = nullptr;
+    bool ready_ = false;
+    int cell_mv_ = -1;
+    int history_[kHistory] = {};
+    int history_index_ = 0;
+    int history_count_ = 0;
+};
+
+static void BatterySampleTask(void* arg) {
+    auto* battery = static_cast<SparkBotBattery*>(arg);
+    while (true) {
+        battery->Update();
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
-
-static void BatteryProbeStart() {
-    xTaskCreate(BatteryProbeTask, "bat_probe", 3072, nullptr, 3, nullptr);
-}
-// ===== BATTERY_PROBE END =====
+// ===== BATTERY END =====
 
 #define TAG "esp_sparkbot"
 
@@ -113,6 +210,7 @@ private:
     Button boot_button_;
     Display* display_;
     EspVideo* camera_;
+    SparkBotBattery battery_;
     light_mode_t light_mode_ = LIGHT_MODE_ALWAYS_ON;
 
     void InitializeI2c() {
@@ -276,8 +374,29 @@ private:
         ESP_LOGI(TAG, "Sent command: %s", command_str);
     }
 
+    void InitializeBattery() {
+        if (!battery_.Begin()) {
+            return;
+        }
+        // 先同步采一次，保证第一个 /status 就有数
+        battery_.Update();
+        xTaskCreate(BatterySampleTask, "battery", 3072, &battery_, 2, nullptr);
+    }
+
     void InitializeTools() {
         auto& mcp_server = McpServer::GetInstance();
+
+        mcp_server.AddTool("self.battery.get_status", "获取主体板电池电量和电压", PropertyList(),
+                           [this](const PropertyList& properties) -> ReturnValue {
+                               if (!battery_.IsReady()) {
+                                   return std::string("电池检测不可用");
+                               }
+                               battery_.Update();
+                               return std::string("电量 ") + std::to_string(battery_.Percent()) +
+                                      "%，电压 " + std::to_string(battery_.CellMillivolts()) +
+                                      " mV";
+                           });
+
         // 定义设备的属性
         mcp_server.AddTool("self.chassis.get_light_mode", "获取灯光效果编号", PropertyList(),
                            [this](const PropertyList& properties) -> ReturnValue {
@@ -360,12 +479,22 @@ public:
         InitializeButtons();
         InitializeCamera();
         InitializeEchoUart();
+        InitializeBattery();
         InitializeTools();
         // LOCAL_CONTROL_PATCH: 在板级完成 UART 与摄像头初始化后，起局域网遥控服务。
         // lambda 捕获 this 以复用 private 的 SendUartMessage，无需开放可见性。
-        LocalControlStart([this](const char* cmd) { SendUartMessage(cmd); });
+        LocalControlStart([this](const char* cmd) { SendUartMessage(cmd); },
+                          [this](int& cell_mv, int& percent, bool& charging) {
+                              if (!battery_.IsReady() || battery_.CellMillivolts() <= 0) {
+                                  return false;
+                              }
+                              cell_mv = battery_.CellMillivolts();
+                              percent = battery_.Percent();
+                              charging = battery_.IsCharging();
+                              return true;
+                          });
+
         GetBacklight()->RestoreBrightness();
-        BatteryProbeStart();  // BATTERY_PROBE
     }
 
     virtual AudioCodec* GetAudioCodec() override {
@@ -384,6 +513,17 @@ public:
     }
 
     virtual Camera* GetCamera() override { return camera_; }
+
+    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
+        if (!battery_.IsReady()) {
+            return false;
+        }
+        const bool is_charging = battery_.IsCharging();
+        charging = is_charging;
+        discharging = !is_charging;
+        level = battery_.Percent();
+        return true;
+    }
 };
 
 DECLARE_BOARD(EspSparkBot);

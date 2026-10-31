@@ -16,4 +16,8 @@
 //          GET /snapshot    单帧 JPEG
 //
 // send_command 用于把指令写入履带底盘 UART，由板级代码注入。
-void LocalControlStart(std::function<void(const char*)> send_command);
+// battery_provider 可选，注入后 /status 会带上主体板电池信息（底盘电池不在此列，
+// 它由底盘侧的 C2 自己管理）。返回 false 表示暂不可用，字段会被省略。
+using BatteryProvider = std::function<bool(int& cell_mv, int& percent, bool& charging)>;
+void LocalControlStart(std::function<void(const char*)> send_command,
+                       BatteryProvider battery_provider = nullptr);

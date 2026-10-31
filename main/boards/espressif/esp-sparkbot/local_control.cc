@@ -31,6 +31,7 @@ constexpr uint16_t kCamPort = 8081;
 constexpr size_t kMaxJpegBytes = 200 * 1024;
 
 std::function<void(const char*)> g_send;
+BatteryProvider g_battery;
 httpd_handle_t g_ctrl_server = nullptr;
 httpd_handle_t g_cam_server = nullptr;
 SemaphoreHandle_t g_cam_lock = nullptr;
@@ -210,8 +211,18 @@ esp_err_t HandleRot(httpd_req_t* req) {
 }
 
 esp_err_t HandleStatus(httpd_req_t* req) {
-    char body[288];
+    char body[384];
     char flush[64] = "";
+    char battery[64] = "";
+    if (g_battery) {
+        int cell_mv = 0;
+        int percent = 0;
+        bool charging = false;
+        if (g_battery(cell_mv, percent, charging)) {
+            snprintf(battery, sizeof(battery), ",\"batt\":%d,\"batt_mv\":%d,\"charging\":%s",
+                     percent, cell_mv, charging ? "true" : "false");
+        }
+    }
 #if CONFIG_USE_EMOTE_MESSAGE_STYLE
     // 表情动画走的是"帧被推上面板"这条路，计数在长就跑说明渲染没卡住。
     int64_t since_us = emote::GetMicrosecondsSinceLastFlush();
@@ -221,11 +232,11 @@ esp_err_t HandleStatus(httpd_req_t* req) {
 #endif
     snprintf(body, sizeof(body),
              "{\"ok\":true,\"ip\":\"%s\",\"x\":%.2f,\"y\":%.2f,\"uptime_s\":%lld,"
-             "\"camera\":%s,\"rot\":%s%s}",
+             "\"camera\":%s,\"rot\":%s%s%s}",
              g_ip, g_speed_x, g_speed_y,
              (long long)((esp_timer_get_time() - g_boot_us) / 1000000),
              Board::GetInstance().GetCamera() != nullptr ? "true" : "false",
-             g_rot180 ? "true" : "false", flush);
+             g_rot180 ? "true" : "false", flush, battery);
     return ReplyJson(req, body);
 }
 
@@ -342,7 +353,8 @@ async function poll(){
   try{const r=await fetch('http://'+H+':'+C+'/status',{cache:'no-store'});
     const j=await r.json();
     stat.textContent=j.ip+' · 速度 '+Math.round(speed*100)+'% · 在线 '+
-      (j.uptime_s/60).toFixed(0)+' 分钟';
+      (j.uptime_s/60).toFixed(0)+' 分钟'+
+      (typeof j.batt==='number' ? ' · 电量 '+j.batt+'%'+(j.charging?'（充电中）':'') : '');
     if(typeof j.rot==='boolean'&&j.rot!==rot){rot=j.rot; paintRot();}
   }catch(e){stat.textContent='设备离线';}
   setTimeout(poll,2000);
@@ -502,12 +514,14 @@ void BootstrapTask(void*) {
 
 }  // namespace
 
-void LocalControlStart(std::function<void(const char*)> send_command) {
+void LocalControlStart(std::function<void(const char*)> send_command,
+                       BatteryProvider battery_provider) {
     if (g_send) {
         ESP_LOGW(TAG, "already started");
         return;
     }
     g_send = std::move(send_command);
+    g_battery = std::move(battery_provider);
     g_boot_us = esp_timer_get_time();
     g_cam_lock = xSemaphoreCreateMutex();
     if (g_cam_lock == nullptr) {
