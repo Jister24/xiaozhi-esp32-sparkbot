@@ -46,7 +46,11 @@ int64_t g_boot_us = 0;
 // 板载 GC2145 装反了，默认把画面转 180°；开关持久化在 NVS 里，掉电不丢
 constexpr const char* kNvsNamespace = "local_ctrl";
 constexpr const char* kNvsRotateKey = "rot180";
+// 实测：上下是正的、左右是反的（180° 已经校正了上下，但把左右也镜像了），
+// 所以再叠一次左右镜像，净效果等于只做垂直翻转。默认开启。
+constexpr const char* kNvsMirrorKey = "mirrorh";
 bool g_rot180 = true;
+bool g_mirror_h = true;
 
 // ---------------------------------------------------------------------------
 // 公共工具
@@ -186,6 +190,24 @@ void ApplyRotate180(bool enabled, bool persist) {
     ESP_LOGI(TAG, "rotate180 = %d", (int)enabled);
 }
 
+bool LoadMirrorHorizontal() {
+    Settings settings(kNvsNamespace, false);
+    return settings.GetBool(kNvsMirrorKey, true);  // 默认左右镜像
+}
+
+void ApplyMirrorHorizontal(bool enabled, bool persist) {
+    g_mirror_h = enabled;
+    Camera* camera = Board::GetInstance().GetCamera();
+    if (camera != nullptr) {
+        camera->SetMirrorHorizontal(enabled);
+    }
+    if (persist) {
+        Settings settings(kNvsNamespace, true);
+        settings.SetBool(kNvsMirrorKey, enabled);
+    }
+    ESP_LOGI(TAG, "mirror_h = %d", (int)enabled);
+}
+
 // ---------------------------------------------------------------------------
 // 摄像头取帧（与云端拍照共用一把锁，避免 frame_ 被并发改写）
 // ---------------------------------------------------------------------------
@@ -258,6 +280,17 @@ esp_err_t HandleRot(httpd_req_t* req) {
     return ReplyJson(req, g_rot180 ? "{\"rot\":true}" : "{\"rot\":false}");
 }
 
+esp_err_t HandleMirror(httpd_req_t* req) {
+    NoteClientActivity();
+    char raw[8];
+    bool on = !g_mirror_h;  // 不带参数就切换
+    if (QueryValue(req, "on", raw, sizeof(raw))) {
+        on = (raw[0] == '1' || raw[0] == 't' || raw[0] == 'T' || raw[0] == 'y');
+    }
+    ApplyMirrorHorizontal(on, true);
+    return ReplyJson(req, g_mirror_h ? "{\"mirror\":true}" : "{\"mirror\":false}");
+}
+
 esp_err_t HandleStatus(httpd_req_t* req) {
     NoteClientActivity();
     char body[480];
@@ -292,11 +325,12 @@ esp_err_t HandleStatus(httpd_req_t* req) {
 #endif
     snprintf(body, sizeof(body),
              "{\"ok\":true,\"ip\":\"%s\",\"x\":%.2f,\"y\":%.2f,\"uptime_s\":%lld,"
-             "\"camera\":%s,\"rot\":%s,\"ps\":\"%s\"%s%s%s}",
+             "\"camera\":%s,\"rot\":%s,\"mirror\":%s,\"ps\":\"%s\"%s%s%s}",
              g_ip, g_speed_x, g_speed_y,
              (long long)((esp_timer_get_time() - g_boot_us) / 1000000),
              Board::GetInstance().GetCamera() != nullptr ? "true" : "false",
-             g_rot180 ? "true" : "false", g_ps_active ? "none" : "min_modem",
+             g_rot180 ? "true" : "false", g_mirror_h ? "true" : "false",
+             g_ps_active ? "none" : "min_modem",
              flush, battery, chassis);
     return ReplyJson(req, body);
 }
@@ -343,23 +377,33 @@ background:#1c2027;color:#8a9099;font-size:12.5px;cursor:pointer}
 </div>
 <div class="speed"><span>速度</span><input type="range" id="spd" min="10" max="100" value="100"><span id="spdv">100%</span></div>
 <button class="wide" id="rot">画面方向：已转正 180°</button>
+<button class="wide" id="mir">左右镜像：已开启</button>
 <script>
 const H=location.hostname, C=8080, V=8081;
 const stat=document.getElementById('stat'), view=document.getElementById('view');
 const spd=document.getElementById('spd'), spdv=document.getElementById('spdv');
-const rotBtn=document.getElementById('rot');
-let speed=1, rot=true;
+const rotBtn=document.getElementById('rot'), mirBtn=document.getElementById('mir');
+let speed=1, rot=true, mirror=true;
 spd.oninput=()=>{speed=spd.value/100; spdv.textContent=spd.value+'%';};
 
 // 传感器倒装，固件默认把画面转 180°；这里可以现场切回原始方向对比
 function paintRot(){rotBtn.textContent='画面方向：'+(rot?'已转正 180°':'原始（未旋转）');}
+// 上下正了但左右反，用独立开关再镜像一次；和 180° 叠加等于只做垂直翻转
+function paintMir(){mirBtn.textContent='左右镜像：'+(mirror?'已开启':'已关闭');}
 function restartStream(){view.src='http://'+H+':'+V+'/stream?t='+Date.now();}
-paintRot();
+paintRot(); paintMir();
 rotBtn.onclick=async()=>{
   try{
     const r=await fetch('http://'+H+':'+C+'/rot?on='+(rot?0:1),{cache:'no-store'});
     const j=await r.json();
     rot=!!j.rot; paintRot(); restartStream();
+  }catch(e){}
+};
+mirBtn.onclick=async()=>{
+  try{
+    const r=await fetch('http://'+H+':'+C+'/mirror?on='+(mirror?0:1),{cache:'no-store'});
+    const j=await r.json();
+    mirror=!!j.mirror; paintMir(); restartStream();
   }catch(e){}
 };
 
@@ -418,6 +462,7 @@ async function poll(){
       (typeof j.batt==='number' ? ' · 本体 '+j.batt+'%'+(j.charging?'⚡':'') : '')+
       (typeof j.chassis_batt==='number' ? ' · 底盘 '+j.chassis_batt+'%'+(j.chassis_charging?'⚡':'') : '');
     if(typeof j.rot==='boolean'&&j.rot!==rot){rot=j.rot; paintRot();}
+    if(typeof j.mirror==='boolean'&&j.mirror!==mirror){mirror=j.mirror; paintMir();}
   }catch(e){stat.textContent='设备离线';}
   setTimeout(poll,2000);
 }
@@ -513,6 +558,7 @@ bool StartControlServer() {
     RegisterRoute(g_ctrl_server, "/stop", HTTP_GET, HandleStop);
     RegisterRoute(g_ctrl_server, "/cmd", HTTP_GET, HandleCmd);
     RegisterRoute(g_ctrl_server, "/rot", HTTP_GET, HandleRot);
+    RegisterRoute(g_ctrl_server, "/mirror", HTTP_GET, HandleMirror);
     RegisterRoute(g_ctrl_server, "/status", HTTP_GET, HandleStatus);
 
     ESP_LOGI(TAG, "control server on :%d", kCtrlPort);
@@ -570,6 +616,7 @@ void BootstrapTask(void*) {
 
     // 摄像头此时已初始化，可以把上次保存的画面方向应用上去
     ApplyRotate180(LoadRotate180(), false);
+    ApplyMirrorHorizontal(LoadMirrorHorizontal(), false);
 
     StartControlServer();
     StartCameraServer();

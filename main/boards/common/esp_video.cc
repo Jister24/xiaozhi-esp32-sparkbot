@@ -529,6 +529,98 @@ void EspVideo::RotateFrame180() {
     }
 }
 
+// LOCAL_CONTROL_PATCH: 逐行左右镜像。与 180° 旋转正交：两者同时开启，净效果等于
+// 纯垂直翻转。行内像素倒排即可，不需要第二块缓冲。
+void EspVideo::SetMirrorHorizontal(bool enabled) {
+    mirror_h_ = enabled;
+    ESP_LOGI(TAG, "mirror_h = %d", (int)enabled);
+}
+
+void EspVideo::MirrorFrameHorizontal() {
+    const uint16_t width = frame_.width;
+    const uint16_t height = frame_.height;
+    if (frame_.data == nullptr || width < 2 || height == 0) {
+        return;
+    }
+
+    // 通用路径：bpp 字节一个像素，逐行把首尾像素对调
+    auto mirror_rows = [&](size_t bpp) {
+        const size_t stride = static_cast<size_t>(width) * bpp;
+        if (frame_.len < stride * height) {
+            ESP_LOGW(TAG, "mirror_h: frame too small (%u x %u, %u bytes)", width, height,
+                     (unsigned)frame_.len);
+            return;
+        }
+        for (uint16_t y = 0; y < height; ++y) {
+            uint8_t* row = frame_.data + stride * y;
+            uint8_t* head = row;
+            uint8_t* tail = row + stride - bpp;
+            while (head < tail) {
+                for (size_t k = 0; k < bpp; ++k) {
+                    uint8_t tmp = head[k];
+                    head[k] = tail[k];
+                    tail[k] = tmp;
+                }
+                head += bpp;
+                tail -= bpp;
+            }
+        }
+    };
+
+    switch (frame_.format) {
+        case V4L2_PIX_FMT_RGB565:
+            mirror_rows(2);
+            break;
+        case V4L2_PIX_FMT_GREY:
+            mirror_rows(1);
+            break;
+        case V4L2_PIX_FMT_RGB24:
+            mirror_rows(3);
+            break;
+        case V4L2_PIX_FMT_YUYV:
+        case V4L2_PIX_FMT_UYVY: {
+            // 4 字节一个宏像素（两个像素共用一组色度）。行内倒排之后，
+            // 组内两个 Y 还得对调，否则亮度会左右错开一个采样点。
+            const bool yuyv = (frame_.format == V4L2_PIX_FMT_YUYV);
+            auto swap_luma = [yuyv](uint32_t v) -> uint32_t {
+                if (yuyv) {  // 内存布局 Y0 U Y1 V -> 交换第 0、2 字节
+                    return (v & 0xFF00FF00u) | ((v & 0x000000FFu) << 16) |
+                           ((v >> 16) & 0x000000FFu);
+                }
+                // 内存布局 U Y0 V Y1 -> 交换第 1、3 字节
+                return (v & 0x00FF00FFu) | ((v & 0x0000FF00u) << 16) |
+                       ((v >> 16) & 0x0000FF00u);
+            };
+            const size_t stride = static_cast<size_t>(width) * 2;
+            if (frame_.len < stride * height) {
+                ESP_LOGW(TAG, "mirror_h: frame too small (%u x %u, %u bytes)", width, height,
+                         (unsigned)frame_.len);
+                break;
+            }
+            for (uint16_t y = 0; y < height; ++y) {
+                auto* words = reinterpret_cast<uint32_t*>(frame_.data + stride * y);
+                const size_t count = stride / 4;
+                if (count < 2) {
+                    continue;
+                }
+                for (size_t i = 0, j = count - 1; i < j; ++i, --j) {
+                    uint32_t head = words[i];
+                    uint32_t tail = words[j];
+                    words[i] = swap_luma(tail);
+                    words[j] = swap_luma(head);
+                }
+                if (count & 1) {  // 中间那组没有配对元素，只做组内对调
+                    words[count / 2] = swap_luma(words[count / 2]);
+                }
+            }
+            break;
+        }
+        default:
+            ESP_LOGW(TAG, "mirror_h: format 0x%08lx not supported, skipped", frame_.format);
+            break;
+    }
+}
+
 bool EspVideo::Capture() {
     if (encoder_thread_.joinable()) {
         encoder_thread_.join();
@@ -897,6 +989,11 @@ bool EspVideo::Capture() {
         RotateFrame180();
     }
 #endif
+    // LOCAL_CONTROL_PATCH: 左右镜像独立于上面的 180°，供「上下正常但左右反」的
+    // 安装方向补救；与 180° 叠加时等价于纯垂直翻转。
+    if (mirror_h_) {
+        MirrorFrameHorizontal();
+    }
 
     // 显示预览图片
     auto display = Board::GetInstance().GetDisplay();

@@ -62,9 +62,15 @@ public:
     // 同时作用于 LCD 预览、局域网图传与云端拍照。
     virtual void SetRotate180(bool enabled) override;
 
+    // LOCAL_CONTROL_PATCH: 左右镜像（逐行像素倒排），同样作用在 Capture() 里，
+    // 三条取图链路口径一致。默认关闭，由 NVS 里的方向设置决定。
+    virtual void SetMirrorHorizontal(bool enabled) override;
+
 private:
     void RotateFrame180();
+    void MirrorFrameHorizontal();
     bool rotate180_ = true;
+    bool mirror_h_ = false;
 
 public:
 };
