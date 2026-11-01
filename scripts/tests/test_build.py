@@ -17,6 +17,22 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(build)
 
 
+def board_config_paths(pattern: str = "config*.json"):
+    """Every real board config under main/boards, and nothing else.
+
+    A board directory may also hold assets/<resolution>/config.json — asset
+    metadata (fonts, emoji sets, wake-word models) packed into the assets
+    partition, not a board config. Scanning those as boards produces errors
+    like `missing non-empty top-level "type"`.
+    """
+    return sorted(
+        path
+        for path in (ROOT / "main/boards").rglob(pattern)
+        if build._is_board_config_path(path)
+    )
+
+
+
 class VersionTests(unittest.TestCase):
     def test_parse_and_match(self):
         self.assertEqual(build._parse_version("ESP-IDF v6.0.1"), (6, 0, 1))
@@ -95,7 +111,7 @@ class VersionTests(unittest.TestCase):
             "m5stack-tab5-p4x",
         )
 
-        for config_path in (ROOT / "main/boards").rglob("config.json"):
+        for config_path in board_config_paths("config.json"):
             config = json.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual(build._get_reported_type(config), config["type"])
             self.assertNotIn("board_name", config, config_path)
@@ -135,9 +151,7 @@ class VersionTests(unittest.TestCase):
         name_owners = {}
         pair_owners = {}
 
-        for config_path in sorted(
-            (ROOT / "main/boards").rglob("config*.json")
-        ):
+        for config_path in board_config_paths():
             config = json.loads(config_path.read_text(encoding="utf-8"))
             board = config_path.parent.relative_to(
                 ROOT / "main/boards"
@@ -170,9 +184,7 @@ class VersionTests(unittest.TestCase):
                 pair_owners[pair] = config_path
 
     def test_language_and_wake_word_are_not_board_config_options(self):
-        for config_path in sorted(
-            (ROOT / "main/boards").rglob("config*.json")
-        ):
+        for config_path in board_config_paths():
             config = json.loads(config_path.read_text(encoding="utf-8"))
             for build_config in config.get("builds", []):
                 for option in build_config.get("sdkconfig_append", []):
@@ -197,9 +209,7 @@ class VersionTests(unittest.TestCase):
     def test_gc0308_camera_sdkconfig_keys_use_digit_zero(self):
         # ESP-IDF silently ignores unknown Kconfig keys. The GC0308 sensor
         # option names use digit 0 (CAMERA_GC0308), not letter O (GCO308).
-        for config_path in sorted(
-            (ROOT / "main/boards").rglob("config*.json")
-        ):
+        for config_path in board_config_paths():
             config = json.loads(config_path.read_text(encoding="utf-8"))
             for build_config in config.get("builds", []):
                 for option in build_config.get("sdkconfig_append", []):
@@ -222,9 +232,7 @@ class VersionTests(unittest.TestCase):
             return values
 
         base_defaults = read_defaults(ROOT / "sdkconfig.defaults")
-        for config_path in sorted(
-            (ROOT / "main/boards").rglob("config*.json")
-        ):
+        for config_path in board_config_paths():
             config = json.loads(config_path.read_text(encoding="utf-8"))
             defaults = dict(base_defaults)
             defaults.update(

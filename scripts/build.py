@@ -382,6 +382,23 @@ def _wake_word_sdkconfig_options(
 
 _BOARDS_DIR = Path("main/boards")
 
+# 板子目录下可以带 assets/<分辨率>/config.json，装的是字体、emoji 集合、唤醒词模型
+# 这类素材元数据。它会随 EMOTE_EXTERNAL_PATH 打进 assets 分区，文件名和位置都不能动，
+# 所以不能为了避开扫描而改名。
+_ASSETS_DIR_NAME = "assets"
+
+
+def _is_board_config_path(path: Path) -> bool:
+    """Tell a board config apart from an asset-package config of the same name.
+
+    Board configs live at boards/<vendor>/<board>/config.json. Asset packages add
+    boards/<vendor>/<board>/assets/<resolution>/config.json, which carries font,
+    emoji-set and wake-word metadata instead of a board type. Only the former is
+    a board config; anything below an ``assets`` directory is not.
+    """
+    return _ASSETS_DIR_NAME not in Path(path).parts[:-1]
+
+
 _DISPLAY_STYLE_SYMBOLS = {
     "default": "CONFIG_USE_DEFAULT_MESSAGE_STYLE",
     "wechat": "CONFIG_USE_WECHAT_MESSAGE_STYLE",
@@ -864,12 +881,7 @@ def _collect_variants(
         board_dir = cfg_path.parent
         if board_dir.name == "common":
             continue
-        # 素材包目录（boards/<vendor>/<board>/assets/<分辨率>/config.json）里也有一个
-        # 同名的 config.json，装的是字体、emoji 集合、唤醒词模型这类素材元数据，不是
-        # 板级配置。它会随 EMOTE_EXTERNAL_PATH 打进 assets 分区，名字和位置都不能改。
-        # 不跳过的话，这里会把它当成一个缺 type 字段的板子，整个构建直接抛
-        # "missing non-empty top-level type"。esp-sparkbot 的 240×240 素材就是这样。
-        if "assets" in cfg_path.relative_to(_BOARDS_DIR).parts[:-1]:
+        if not _is_board_config_path(cfg_path):
             continue
         board = board_dir.relative_to(_BOARDS_DIR).as_posix()
 
