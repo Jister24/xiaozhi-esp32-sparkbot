@@ -95,6 +95,11 @@
       "build_options": {
         "network_type": "ethernet"
       }
+    },
+    {
+      "board": "espressif/esp-sparkbot",
+      "name": "esp-sparkbot",
+      "reason": "Target board of this fork; GC2145 camera, emote (non-LVGL) display and board-to-board UART remote control"
     }
   ]
 }
