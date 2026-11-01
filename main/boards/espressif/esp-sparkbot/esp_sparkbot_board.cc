@@ -217,6 +217,10 @@ private:
     // 触摸按键：FPC 铜箔贴在顶部与左右两侧，直接进 S3 的触摸通道 1/2/3
     touch_sensor_handle_t touch_sens_ = nullptr;
     touch_channel_handle_t touch_chan_[3] = {nullptr, nullptr, nullptr};
+    // 回调里只置标志，不在中断上下文做任何耗时动作。
+    // 用 inline static 省掉类外定义；回调是无捕获 lambda，只能碰静态成员。
+    inline static bool touch_active_[3] = {false, false, false};
+    inline static uint32_t touch_hits_[3] = {0, 0, 0};
     bool sleep_face_on_ = false;  // 低功耗时是否已经把脸换成睡觉
 
     void InitializeI2c() {
@@ -289,6 +293,9 @@ private:
                 return false;
             }
         }
+        // 官方示例 Step 3：显式配置滤波器。缺了这一步 smooth 数据可能不随触摸更新。
+        touch_sensor_filter_config_t filter_cfg = TOUCH_SENSOR_DEFAULT_FILTER_CONFIG();
+        touch_sensor_config_filter(touch_sens_, &filter_cfg);
         if (touch_sensor_enable(touch_sens_) != ESP_OK) {
             return false;
         }
@@ -296,6 +303,101 @@ private:
         for (int k = 0; k < 5; ++k) {
             touch_sensor_trigger_oneshot_scanning(touch_sens_, 2000);
         }
+        // 官方示例 Step 5：回调。这是判断"有没有摸到"最直接的证据。
+        touch_event_callbacks_t callbacks = {};
+        callbacks.on_active = [](touch_sensor_handle_t, const touch_active_event_data_t* e, void*) -> bool {
+            int idx = (int)e->chan_id - 1;
+            if (idx >= 0 && idx < 3) {
+                touch_active_[idx] = true;
+                touch_hits_[idx] = touch_hits_[idx] + 1;
+            }
+            return false;
+        };
+        callbacks.on_inactive = [](touch_sensor_handle_t, const touch_inactive_event_data_t* e, void*) -> bool {
+            int idx = (int)e->chan_id - 1;
+            if (idx >= 0 && idx < 3) {
+                touch_active_[idx] = false;
+            }
+            return false;
+        };
+        touch_sensor_register_callbacks(touch_sens_, &callbacks, nullptr);
+        // 官方示例 Step 7：连续扫描。手动单次触发时滤波收敛不充分，读数几乎不响应。
+        touch_sensor_start_continuous_scanning(touch_sens_);
+        return true;
+    }
+
+    // ?scan=1 —— 把所有触摸通道（CH1~CH13）一次性建起来读一遍基准值。
+    // 目的：判断 GPIO1/2/3 上到底有没有接东西。如果某几个通道的基准值明显
+    // 高于其余通道，说明那几个脚挂了电极；如果 14 个通道读数都差不多，
+    // 那就是内部走线差异，电极其实没接在这三个脚上。
+    // 跳过 CH4/CH5（I2C 的 GPIO4/5，避免动到音频 codec 的总线）。
+    bool ScanAllChannels(std::string& out) {
+        if (!EnsureTouchReady()) {
+            out = "{\"ok\":false,\"err\":\"touch init failed\"}";
+            return true;
+        }
+        touch_sensor_stop_continuous_scanning(touch_sens_);
+        touch_sensor_disable(touch_sens_);
+
+        struct Item { int id; touch_channel_handle_t h; bool owned; };
+        static Item items[16];
+        int n = 0;
+        touch_channel_config_t chan_cfg = {};
+        chan_cfg.active_thresh[0] = 2000;
+        chan_cfg.charge_speed = TOUCH_CHARGE_SPEED_7;
+        chan_cfg.init_charge_volt = TOUCH_INIT_CHARGE_VOLT_DEFAULT;
+
+        for (int id = 1; id <= 13; ++id) {
+            if (id == 4 || id == 5) {
+                continue;
+            }
+            if (id <= 3) {
+                items[n].id = id;
+                items[n].h = touch_chan_[id - 1];
+                items[n].owned = false;
+                n++;
+                continue;
+            }
+            touch_channel_handle_t h = nullptr;
+            if (touch_sensor_new_channel(touch_sens_, id, &chan_cfg, &h) == ESP_OK) {
+                items[n].id = id;
+                items[n].h = h;
+                items[n].owned = true;
+                n++;
+            }
+        }
+
+        touch_sensor_enable(touch_sens_);
+        for (int k = 0; k < 8; ++k) {
+            touch_sensor_trigger_oneshot_scanning(touch_sens_, 2000);
+        }
+
+        out = "{\"ok\":true,\"channels\":[";
+        bool first = true;
+        for (int i = 0; i < n; ++i) {
+            uint32_t b[TOUCH_SAMPLE_CFG_NUM] = {};
+            uint32_t v[TOUCH_SAMPLE_CFG_NUM] = {};
+            touch_channel_read_data(items[i].h, TOUCH_CHAN_DATA_TYPE_BENCHMARK, b);
+            touch_channel_read_data(items[i].h, TOUCH_CHAN_DATA_TYPE_SMOOTH, v);
+            touch_chan_info_t info = {};
+            touch_sensor_get_channel_info(items[i].h, &info);
+            char buf[160];
+            snprintf(buf, sizeof(buf),
+                     "%s{\"ch\":%d,\"gpio\":%d,\"bench\":%lu,\"smooth\":%lu}",
+                     first ? "" : ",", items[i].id, (int)info.chan_gpio,
+                     (unsigned long)b[0], (unsigned long)v[0]);
+            first = false;
+            out += buf;
+        }
+        out += "]}";
+
+        for (int i = 0; i < n; ++i) {
+            if (items[i].owned) {
+                touch_sensor_del_channel(items[i].h);
+            }
+        }
+        // 删完恢复连续扫描
+        touch_sensor_start_continuous_scanning(touch_sens_);
         return true;
     }
 
@@ -311,19 +413,32 @@ private:
         }
         int sample_ms = ParseQueryInt(query, "ms", 0);
         if (sample_ms < 0) sample_ms = 0;
-        if (sample_ms > 15000) sample_ms = 15000;
+        if (sample_ms > 20000) sample_ms = 20000;
 
         uint32_t bench[3] = {0, 0, 0};
         uint32_t smooth[3] = {0, 0, 0};
+        uint32_t raw[3] = {0, 0, 0};
         uint32_t vmin[3] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
         uint32_t vmax[3] = {0, 0, 0};
+        uint32_t rmin[3] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+        uint32_t rmax[3] = {0, 0, 0};
 
+        // 加 ?series=1 时把每轮 smooth 逐点记下来：峰值可能只持续一两轮，
+        // 只看 min/max 的话短暂触摸会被平均掉，看不出是哪一路在动。
+        const bool series = strstr(query, "series=") != nullptr;
+        constexpr int kMaxTrace = 400;
+        static uint32_t trace[3][kMaxTrace];
+        int trace_n = 0;
+
+        for (int i = 0; i < 3; ++i) {
+            touch_hits_[i] = 0;
+        }
         int rounds = sample_ms > 0 ? (sample_ms / 50) : 1;
         for (int r = 0; r < rounds; ++r) {
-            touch_sensor_trigger_oneshot_scanning(touch_sens_, 2000);
             for (int i = 0; i < 3; ++i) {
                 uint32_t b[TOUCH_SAMPLE_CFG_NUM] = {};
                 uint32_t v[TOUCH_SAMPLE_CFG_NUM] = {};
+                uint32_t w[TOUCH_SAMPLE_CFG_NUM] = {};
                 if (touch_channel_read_data(touch_chan_[i], TOUCH_CHAN_DATA_TYPE_BENCHMARK, b) == ESP_OK) {
                     bench[i] = b[0];
                 }
@@ -332,6 +447,18 @@ private:
                     if (v[0] < vmin[i]) vmin[i] = v[0];
                     if (v[0] > vmax[i]) vmax[i] = v[0];
                 }
+                // RAW 是未经平滑的原始读数，smooth 不动但 raw 动 = 阈值/滤波把信号吃掉了
+                if (touch_channel_read_data(touch_chan_[i], TOUCH_CHAN_DATA_TYPE_RAW, w) == ESP_OK) {
+                    raw[i] = w[0];
+                    if (w[0] < rmin[i]) rmin[i] = w[0];
+                    if (w[0] > rmax[i]) rmax[i] = w[0];
+                }
+            }
+            if (series && trace_n < kMaxTrace) {
+                for (int i = 0; i < 3; ++i) {
+                    trace[i][trace_n] = smooth[i];
+                }
+                trace_n++;
             }
             if (sample_ms > 0) {
                 vTaskDelay(pdMS_TO_TICKS(50));
@@ -342,18 +469,43 @@ private:
         out += std::to_string(rounds);
         out += ",\"channels\":[";
         for (int i = 0; i < 3; ++i) {
-            char buf[192];
+            char buf[256];
             snprintf(buf, sizeof(buf),
                      "%s{\"ch\":%d,\"gpio\":%d,\"bench\":%lu,\"smooth\":%lu,"
-                     "\"min\":%lu,\"max\":%lu,\"drop_pct\":%.1f}",
+                     "\"min\":%lu,\"max\":%lu,\"drop_pct\":%.1f,"
+                     "\"raw\":%lu,\"raw_min\":%lu,\"raw_max\":%lu,"
+                     "\"active\":%s,\"hits\":%lu}",
                      i ? "," : "", i + 1, i + 1,
                      (unsigned long)bench[i], (unsigned long)smooth[i],
                      (unsigned long)(vmin[i] == 0xFFFFFFFFu ? 0 : vmin[i]),
                      (unsigned long)vmax[i],
-                     bench[i] > 0 ? (100.0 * (double)(bench[i] - (vmin[i] == 0xFFFFFFFFu ? bench[i] : vmin[i])) / (double)bench[i]) : 0.0);
+                     bench[i] > 0 ? (100.0 * (double)(bench[i] - (vmin[i] == 0xFFFFFFFFu ? bench[i] : vmin[i])) / (double)bench[i]) : 0.0,
+                     (unsigned long)raw[i],
+                     (unsigned long)(rmin[i] == 0xFFFFFFFFu ? 0 : rmin[i]),
+                     (unsigned long)rmax[i],
+                     touch_active_[i] ? "true" : "false",
+                     (unsigned long)touch_hits_[i]);
             out += buf;
         }
-        out += "]}";
+        out += "]";
+        if (series) {
+            out += ",\"trace\":{";
+            for (int i = 0; i < 3; ++i) {
+                if (i) {
+                    out += ",";
+                }
+                out += "\"ch" + std::to_string(i + 1) + "\":[";
+                for (int k = 0; k < trace_n; ++k) {
+                    if (k) {
+                        out += ",";
+                    }
+                    out += std::to_string(trace[i][k]);
+                }
+                out += "]";
+            }
+            out += "}";
+        }
+        out += "}";
         return true;
     }
 
@@ -671,6 +823,9 @@ private:
     }
 
     bool ProbeHardware(const char* query, std::string& out) {
+        if (strstr(query, "scan=") != nullptr) {
+            return ScanAllChannels(out);
+        }
         if (ProbeTouch(query, out)) {
             return true;
         }
@@ -691,7 +846,7 @@ private:
         }
         int sample_ms = ParseQueryInt(query, "ms", 0);
         if (sample_ms < 0) sample_ms = 0;
-        if (sample_ms > 15000) sample_ms = 15000;
+        if (sample_ms > 20000) sample_ms = 20000;
 
         // 只发地址能收到 ACK 的地址有一堆假阳性（同一次上电两次扫描结果都不一样），
         // 所以再加一道「真能读出寄存器」的过滤，读不出来的直接不报。
