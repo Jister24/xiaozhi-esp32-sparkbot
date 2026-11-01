@@ -12,7 +12,6 @@
 //          GET /stop        急停
 //          GET /cmd?c=      下发原始底盘指令，如 d1 / w2 / x0.5 y0.5
 //          GET /status      状态 JSON
-//          GET /probe       硬件探测（I2C 扫描 + 空闲引脚电平），仅用于摸底
 //   8081 — 图像接口
 //          GET /stream      MJPEG 连续流（浏览器 <img> 可直接显示）
 //          GET /snapshot    单帧 JPEG
@@ -23,16 +22,9 @@
 // 底盘电池在 C2 那一侧采样，主体板只能通过 UART 问来，问不到就省略字段。
 using BatteryProvider = std::function<bool(int& cell_mv, int& percent, bool& charging)>;
 
-// 临时探测钩子：把 /probe 的 query string 原样透给板级，板级做完总线/引脚摸底
-// 后返回一段 JSON 字符串，服务端直接下发。不注入则 /probe 返回 501。
-// 用途是确认「新接上的外设（如触摸 FPC）到底挂在哪条总线、哪根脚」，
-// 摸清楚之后可以移除注入，端点留作后续排查工具。
-using ProbeProvider = std::function<bool(const char* query, std::string& out_json)>;
-
 void LocalControlStart(std::function<void(const char*)> send_command,
                        BatteryProvider battery_provider = nullptr,
-                       BatteryProvider chassis_battery_provider = nullptr,
-                       ProbeProvider probe_provider = nullptr);
+                       BatteryProvider chassis_battery_provider = nullptr);
 
 // 当前是否处在 Wi-Fi 省电状态，也就是「没有远程客户端在用的空闲期」。
 // 板级据此在屏幕上换成睡觉表情（见 esp_sparkbot_board.cc 的 UpdateSleepFace），
