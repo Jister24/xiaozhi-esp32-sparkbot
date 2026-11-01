@@ -27,9 +27,12 @@ class CiSelectionTests(unittest.TestCase):
             path.write_text(json.dumps(manifest))
             return build._load_representative_variants(self.variants, path)
 
-    def test_reviewed_list_has_18_builds_and_all_chip_targets(self):
+    def test_reviewed_list_resolves_and_covers_all_chip_targets(self):
         selected = self.load_manifest(self.manifest)
-        self.assertEqual(len(selected), 18)
+        # The reviewed list is expected to change as boards are added, so count
+        # against the manifest itself: what must hold is that every reviewed
+        # entry resolves to a live variant.
+        self.assertEqual(len(selected), len(self.manifest["variants"]))
         self.assertEqual(
             {item["target"] for item in selected},
             {item["target"] for item in self.variants},
@@ -66,7 +69,7 @@ class CiSelectionTests(unittest.TestCase):
         for changes in (paths, list(reversed(paths))):
             with self.subTest(changes=changes):
                 selected = build._select_variants_for_changes(self.variants, changes)
-                self.assertEqual(len(selected), 19)
+                self.assertEqual(len(selected), len(self.manifest["variants"]) + 1)
                 self.assertIn("otto-robot", {v["board"] for v in selected})
 
     def test_representative_board_changes_do_not_duplicate_default_build(self):
@@ -74,7 +77,7 @@ class CiSelectionTests(unittest.TestCase):
             self.variants,
             ["main/application.cc", "main/boards/bread-compact-wifi/config.h"],
         )
-        self.assertEqual(len(selected), 19)
+        self.assertEqual(len(selected), len(self.manifest["variants"]) + 1)
         self.assertEqual(
             sorted(v["name"] for v in selected if v["board"] == "bread-compact-wifi"),
             ["bread-compact-wifi", "bread-compact-wifi-128x64"],
@@ -120,7 +123,12 @@ class CiSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unsupported build option"):
             self.load_manifest(invalid)
         invalid = copy.deepcopy(self.manifest)
-        invalid["variants"][-1]["build_options"] = {"network_type": "typo"}
+        # Pick the entry that actually declares build options instead of the
+        # last one; appending a reviewed board must not silently retarget this.
+        option_entry = next(
+            entry for entry in invalid["variants"] if entry.get("build_options")
+        )
+        option_entry["build_options"] = {"network_type": "typo"}
         with self.assertRaisesRegex(ValueError, "must be one of"):
             self.load_manifest(invalid)
 

@@ -89,17 +89,17 @@
       "reason": "USB RNDIS networking"
     },
     {
+      "board": "espressif/esp-sparkbot",
+      "name": "esp-sparkbot",
+      "reason": "Target board of this fork; GC2145 camera, emote (non-LVGL) display and board-to-board UART remote control"
+    },
+    {
       "board": "waveshare/esp32-p4-nano",
       "name": "esp32-p4-nano-10.1-a",
       "reason": "P4-NANO Ethernet conditional compilation path",
       "build_options": {
         "network_type": "ethernet"
       }
-    },
-    {
-      "board": "espressif/esp-sparkbot",
-      "name": "esp-sparkbot",
-      "reason": "Target board of this fork; GC2145 camera, emote (non-LVGL) display and board-to-board UART remote control"
     }
   ]
 }
