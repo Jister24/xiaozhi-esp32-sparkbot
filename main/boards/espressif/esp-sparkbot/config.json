@@ -13,7 +13,8 @@
                 "CONFIG_CAMERA_GC2145_AUTO_DETECT_DVP_INTERFACE_SENSOR=y",
                 "CONFIG_USE_EMOTE_MESSAGE_STYLE=y",
                 "CONFIG_FLASH_EXPRESSION_ASSETS=y",
-                "CONFIG_MMAP_FILE_NAME_LENGTH=32"
+                "CONFIG_MMAP_FILE_NAME_LENGTH=32",
+                "CONFIG_LWIP_MAX_SOCKETS=16"
             ]
         }
     ]

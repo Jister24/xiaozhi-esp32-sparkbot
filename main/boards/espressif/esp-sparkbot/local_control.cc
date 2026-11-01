@@ -52,6 +52,10 @@ constexpr const char* kNvsMirrorKey = "mirrorh";
 bool g_rot180 = true;
 bool g_mirror_h = true;
 
+// 正在推流的客户端数。远程隧道断掉时，httpd 那边可能还有一条卡住的流；
+// 把它暴露到 /status 上，一眼能看出「连不上是因为流没释放」。
+int g_stream_clients = 0;
+
 // ---------------------------------------------------------------------------
 // 公共工具
 // ---------------------------------------------------------------------------
@@ -325,11 +329,12 @@ esp_err_t HandleStatus(httpd_req_t* req) {
 #endif
     snprintf(body, sizeof(body),
              "{\"ok\":true,\"ip\":\"%s\",\"x\":%.2f,\"y\":%.2f,\"uptime_s\":%lld,"
-             "\"camera\":%s,\"rot\":%s,\"mirror\":%s,\"ps\":\"%s\"%s%s%s}",
+             "\"camera\":%s,\"rot\":%s,\"mirror\":%s,\"streams\":%d,\"ps\":\"%s\"%s%s%s}",
              g_ip, g_speed_x, g_speed_y,
              (long long)((esp_timer_get_time() - g_boot_us) / 1000000),
              Board::GetInstance().GetCamera() != nullptr ? "true" : "false",
              g_rot180 ? "true" : "false", g_mirror_h ? "true" : "false",
+             g_stream_clients,
              g_ps_active ? "none" : "min_modem",
              flush, battery, chassis);
     return ReplyJson(req, body);
@@ -499,15 +504,22 @@ esp_err_t HandleStream(httpd_req_t* req) {
     AddCommonHeaders(req);
     httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=sparkbotframe");
     httpd_resp_set_hdr(req, "X-Accel-Buffering", "no");
+    g_stream_clients++;
 
+    int failed = 0;
     for (;;) {
         NoteClientActivity();  // 长连接期间持续续期，别看着看着掉回省电
         std::vector<uint8_t> jpeg;
         if (!CaptureJpeg(jpeg)) {
+            // 连续失败说明摄像头异常或客户端已断，主动收尾，别把槽位一直占着
+            if (++failed > 50) {
+                ESP_LOGW(TAG, "camera unresponsive, closing stream");
+                break;
+            }
             vTaskDelay(pdMS_TO_TICKS(300));
-            // 连续失败说明摄像头异常或客户端已断，主动收尾
             continue;
         }
+        failed = 0;
         char part[128];
         int n = snprintf(part, sizeof(part),
                          "\r\n--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
@@ -521,7 +533,8 @@ esp_err_t HandleStream(httpd_req_t* req) {
         // 约 4~5 fps，兼顾流畅度与 A/V 主链路的 CPU 余量
         vTaskDelay(pdMS_TO_TICKS(60));
     }
-    ESP_LOGI(TAG, "stream client disconnected");
+    g_stream_clients--;
+    ESP_LOGI(TAG, "stream client disconnected, active=%d", g_stream_clients);
     return ESP_OK;
 }
 
@@ -545,7 +558,9 @@ bool StartControlServer() {
     config.server_port = kCtrlPort;
     config.ctrl_port = kCtrlPort + 100;  // 内部事件用，避免与图传实例撞车
     config.stack_size = 6144;
-    config.max_open_sockets = 4;
+    // App 每 3 秒轮询一次 /status，远程隧道还会额外占用几条连接；
+    // 默认 4 个槽位在「隧道 + 本地」并存时会被占满，新连接直接被拒（表现为设备离线）。
+    config.max_open_sockets = 6;
     config.lru_purge_enable = true;
 
     if (httpd_start(&g_ctrl_server, &config) != ESP_OK) {
@@ -570,7 +585,8 @@ bool StartCameraServer() {
     config.server_port = kCamPort;
     config.ctrl_port = kCamPort + 100;
     config.stack_size = 10240;  // 抓帧 + JPEG 编码调用较深
-    config.max_open_sockets = 3;
+    // 图传是长连接：一条被隧道占着、一条本地在看，很快就没槽位了。
+    config.max_open_sockets = 5;
     config.lru_purge_enable = true;
 
     if (httpd_start(&g_cam_server, &config) != ESP_OK) {
