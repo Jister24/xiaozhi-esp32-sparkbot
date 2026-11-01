@@ -34,6 +34,7 @@ constexpr size_t kMaxJpegBytes = 200 * 1024;
 std::function<void(const char*)> g_send;
 BatteryProvider g_battery;
 BatteryProvider g_chassis_battery;
+ProbeProvider g_probe;
 httpd_handle_t g_ctrl_server = nullptr;
 httpd_handle_t g_cam_server = nullptr;
 SemaphoreHandle_t g_cam_lock = nullptr;
@@ -301,6 +302,29 @@ esp_err_t HandleStatus(httpd_req_t* req) {
     return ReplyJson(req, body);
 }
 
+// 硬件摸底：把 query 原样交给板级，板级自己决定扫哪条总线、采哪些脚。
+// 这个端点不为日常使用，只为「插了根新排线，不知道接哪儿」时少拆一次壳。
+esp_err_t HandleProbe(httpd_req_t* req) {
+    NoteClientActivity();
+    if (!g_probe) {
+        AddCommonHeaders(req);
+        httpd_resp_set_status(req, "501 Not Implemented");
+        return httpd_resp_sendstr(req, "probe provider not injected");
+    }
+    char query[160] = "";
+    size_t qlen = httpd_req_get_url_query_len(req);
+    if (qlen > 0 && qlen < sizeof(query) - 1) {
+        httpd_req_get_url_query_str(req, query, sizeof(query));
+    }
+    std::string json;
+    if (!g_probe(query, json)) {
+        AddCommonHeaders(req);
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "probe failed");
+    }
+    return ReplyJson(req, json.c_str());
+}
+
 // 最小可用控制台：方向键 / WASD、速度档位、实时画面
 const char* kIndexHtml = R"HTML(<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -514,6 +538,7 @@ bool StartControlServer() {
     RegisterRoute(g_ctrl_server, "/cmd", HTTP_GET, HandleCmd);
     RegisterRoute(g_ctrl_server, "/rot", HTTP_GET, HandleRot);
     RegisterRoute(g_ctrl_server, "/status", HTTP_GET, HandleStatus);
+    RegisterRoute(g_ctrl_server, "/probe", HTTP_GET, HandleProbe);
 
     ESP_LOGI(TAG, "control server on :%d", kCtrlPort);
     return true;
@@ -591,7 +616,8 @@ bool LocalControlPowerSaveOn() {
 
 void LocalControlStart(std::function<void(const char*)> send_command,
                        BatteryProvider battery_provider,
-                       BatteryProvider chassis_battery_provider) {
+                       BatteryProvider chassis_battery_provider,
+                       ProbeProvider probe_provider) {
     if (g_send) {
         ESP_LOGW(TAG, "already started");
         return;
@@ -599,6 +625,7 @@ void LocalControlStart(std::function<void(const char*)> send_command,
     g_send = std::move(send_command);
     g_battery = std::move(battery_provider);
     g_chassis_battery = std::move(chassis_battery_provider);
+    g_probe = std::move(probe_provider);
     g_boot_us = esp_timer_get_time();
     g_cam_lock = xSemaphoreCreateMutex();
     if (g_cam_lock == nullptr) {

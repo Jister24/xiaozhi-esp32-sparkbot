@@ -1181,6 +1181,7 @@ idf_component_register(SRCS ${SOURCES}
                         esp_driver_jpeg
                         esp_driver_ppa
                         esp_driver_tsens
+                        esp_driver_touch_sens
                         esp_app_format
                         app_update
                         spi_flash
