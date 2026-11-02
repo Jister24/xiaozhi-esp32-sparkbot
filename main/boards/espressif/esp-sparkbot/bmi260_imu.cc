@@ -1,4 +1,4 @@
-#include "bmi270_imu.h"
+#include "bmi260_imu.h"
 
 #include "bmi260_init_data.h"
 
@@ -49,7 +49,29 @@ constexpr float kRadToDeg = 57.29577951f;
 
 constexpr uint32_t kSamplePeriodMs = 10;  // 100Hz
 constexpr int kLogEveryN = 10;            // 每 10 帧一行 = 10Hz
-constexpr float kComplementaryAlpha = 0.98f;
+
+// —— 姿态滤波参数，对应 PX4 attitude_estimator_q 的 ATT_W_* ——
+//
+// 这几个数是用 firmware/tools/attitude_proto.py 在合成数据上扫出来的
+// （10 个随机种子取最差），不是抄来的默认值：
+//   kAccWeight 0.6 → 静止误差 0.39°，手持晃动（0.3g 线加速度）时 2.1°
+//   再大（1.0，即 PX4 默认）：晃动期劣化到 3.1°；
+//   再小（0.4）：晃动期只 1.4°，但冷启动要 5.8s 才收敛——
+//   我们第一帧就用加速度对齐姿态，冷启动不靠增益，所以选偏小的 0.6。
+constexpr float kAccWeight = 0.6f;
+// 零偏学习率。0.1 时静稳误差 0.02°，再大就开始把噪声学成零偏。
+constexpr float kGyroBiasWeight = 0.1f;
+// 零偏限幅 ±1.2dps（PX4 ATT_BIAS_MAX 是 0.05rad/s≈2.9dps）。
+// 实测这颗的零偏都在 0.2dps 以内，限太宽只会在机动时留下更大的残余。
+constexpr float kGyroBiasMaxDps = 1.2f;
+// 加速度门控：只有模长落在这一带才认为「此刻只受重力」。
+// 手持晃动叠上线加速度，模长会跑出这个区间，那几帧的重力方向不可信。
+constexpr float kAccGateLow = 0.88f;
+constexpr float kAccGateHigh = 1.12f;
+// 角速度超过这个值就不学零偏，否则会把真实转动当成零偏学进去
+constexpr float kMaxRateToLearnBiasDps = 10.0f;
+// 静止时陀螺读数里剩下的那点偏置会让航向一直爬，低于这个值就不积分航向。
+// 代价是极慢的转向（<0.5dps）会被吃掉——摇杆用不到，可以接受。
 constexpr float kYawDeadbandDps = 0.5f;
 
 // BMI270 / BMI260 共用同一套寄存器地图
@@ -101,8 +123,8 @@ const char* g_mode = "unknown";
 
 portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
 ImuReadout g_latest;
-float g_roll_zero = 0.0f;
-float g_pitch_zero = 0.0f;
+// 零点请求由 Zero() 置位、采样任务在下一帧消费，避免跨任务共享运行中的四元数
+volatile bool g_zero_request = false;
 
 bool WriteReg(uint8_t reg, uint8_t value) {
     if (g_ctx.dev == nullptr) {
@@ -439,15 +461,142 @@ void AppendBar(char* out, float value, float full_scale) {
     out[kW] = '\0';
 }
 
+// ===========================================================================
+// 姿态解算：四元数非线性互补滤波（PX4 attitude_estimator_q 的移植）
+//
+// 为什么不用欧拉角：两个角度各自减零点看着简单，但① 绕机身轴大角度转时
+// 数值失真，② 零点不在水平面上时「角度相减」不等于相对转角，③ pitch
+// 接近 ±90° 会奇异。四元数没有这些问题，代价是几十行乘加。
+//
+// 每帧三步（dt 固定 10ms）：
+//   1. 预测：把陀螺读数（扣掉零偏）当角速度，右乘一个增量四元数
+//   2. 校正：估计出的重力方向 k = R(q)ᵀ·(0,0,1) 与实测 â 叉乘得到误差，
+//      以 kAccWeight 的比例加进角速度——这就是「互补」的那一半
+//   3. 零偏：把校正量按 kGyroBiasWeight 积分进零偏并限幅。陀螺读数偏高时
+//      估计会跑在前面，校正量指向反方向，积分出的零偏正好把它抵消。
+//      只在慢速时做，机动时学会把真实转动当零偏。
+// ===========================================================================
+
+struct Quat {
+    float w, x, y, z;
+};
+
+Quat QuatMul(const Quat& a, const Quat& b) {
+    return {
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+    };
+}
+
+Quat QuatNormalize(const Quat& q) {
+    const float n = std::sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
+    if (n < 1e-9f) {
+        return {1.0f, 0.0f, 0.0f, 0.0f};
+    }
+    const float inv = 1.0f / n;
+    return {q.w * inv, q.x * inv, q.y * inv, q.z * inv};
+}
+
+// R(q)ᵀ·v，即把世界系向量转到机体系。姿态解算里要的是「重力在机体系的方向」。
+void QuatRotateInv(const Quat& q, const float v[3], float out[3]) {
+    const float cw = q.w;
+    const float cx = -q.x;
+    const float cy = -q.y;
+    const float cz = -q.z;
+    const float tx = 2.0f * (cy * v[2] - cz * v[1]);
+    const float ty = 2.0f * (cz * v[0] - cx * v[2]);
+    const float tz = 2.0f * (cx * v[1] - cy * v[0]);
+    out[0] = v[0] + cw * tx + (cy * tz - cz * ty);
+    out[1] = v[1] + cw * ty + (cz * tx - cx * tz);
+    out[2] = v[2] + cw * tz + (cx * ty - cy * tx);
+}
+
+// 旋转向量（弧度）→ 四元数。这是精确的指数映射，不是一阶近似，
+// 所以 100dps 时单帧 1° 的步长也不会积出偏差。
+Quat QuatFromRotVec(const float rv[3]) {
+    const float ang = std::sqrt(rv[0] * rv[0] + rv[1] * rv[1] + rv[2] * rv[2]);
+    if (ang < 1e-9f) {
+        return {1.0f, 0.0f, 0.0f, 0.0f};
+    }
+    const float half = 0.5f * ang;
+    const float s = std::sin(half) / ang;
+    return {std::cos(half), rv[0] * s, rv[1] * s, rv[2] * s};
+}
+
+// 四元数 → 旋转向量（弧度）。取短弧（w<0 先取反），否则 180° 附近会跳。
+void QuatToRotVec(Quat q, float rv[3]) {
+    if (q.w < 0.0f) {
+        q.w = -q.w;
+        q.x = -q.x;
+        q.y = -q.y;
+        q.z = -q.z;
+    }
+    const float w = q.w > 1.0f ? 1.0f : q.w;
+    const float ang = 2.0f * std::acos(w);
+    const float s = std::sqrt(std::fmax(0.0f, 1.0f - w * w));
+    if (s < 1e-6f) {
+        // 转角接近 0 或 180°，此时不能除以 sin，直接用小角近似
+        rv[0] = 2.0f * q.x;
+        rv[1] = 2.0f * q.y;
+        rv[2] = 2.0f * q.z;
+        return;
+    }
+    rv[0] = q.x / s * ang;
+    rv[1] = q.y / s * ang;
+    rv[2] = q.z / s * ang;
+}
+
+// 冷启动对齐：找到一个旋转，把实测「上」方向转到世界系 z 轴。
+// 航向随便定（没有磁力计，本来就不可观测），倾斜一上电就是准的，
+// 不用靠滤波慢慢收敛。
+Quat QuatAlignUp(const float up[3]) {
+    float n = std::sqrt(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
+    if (n < 1e-6f) {
+        return {1.0f, 0.0f, 0.0f, 0.0f};
+    }
+    const float ux = up[0] / n;
+    const float uy = up[1] / n;
+    const float uz = up[2] / n;
+    // up × (0,0,1)
+    const float ax = uy * 1.0f - uz * 0.0f;
+    const float ay = uz * 0.0f - ux * 1.0f;
+    const float az = 0.0f;
+    const float axis_len = std::sqrt(ax * ax + ay * ay);
+    const float dot = uz;
+    if (axis_len < 1e-6f) {
+        if (dot > 0.0f) {
+            return {1.0f, 0.0f, 0.0f, 0.0f};
+        }
+        return {0.0f, 1.0f, 0.0f, 0.0f};  // 倒置：绕 x 轴转 180°
+    }
+    const float half = 0.5f * std::acos(dot > 1.0f ? 1.0f : (dot < -1.0f ? -1.0f : dot));
+    const float s = std::sin(half) / axis_len;
+    return {std::cos(half), ax * s, ay * s, az * s};
+}
+
+void QuatToEuler(const Quat& q, float* roll, float* pitch, float* yaw) {
+    const float w = q.w, x = q.x, y = q.y, z = q.z;
+    *roll = std::atan2(2.0f * (w * x + y * z), 1.0f - 2.0f * (x * x + y * y)) * kRadToDeg;
+    float sp = 2.0f * (w * y - z * x);
+    sp = sp > 1.0f ? 1.0f : (sp < -1.0f ? -1.0f : sp);
+    *pitch = std::asin(sp) * kRadToDeg;
+    *yaw = std::atan2(2.0f * (w * z + x * y), 1.0f - 2.0f * (y * y + z * z)) * kRadToDeg;
+}
+
 void SampleTask(void*) {
     TickType_t last_wake = xTaskGetTickCount();
     uint32_t seq = 0;
     int log_div = 0;
     int read_fail = 0;
 
-    float roll = 0.0f;
-    float pitch = 0.0f;
-    float yaw = 0.0f;
+    // 滤波器状态：全部是本任务私有的，共享只通过 g_latest / g_zero_request
+    Quat q{1.0f, 0.0f, 0.0f, 0.0f};
+    Quat q_zero{1.0f, 0.0f, 0.0f, 0.0f};
+    float gyro_bias[3] = {0.0f, 0.0f, 0.0f};   // dps
+    bool aligned = false;
+    const float dt = kSamplePeriodMs / 1000.0f;
 
     while (true) {
         int16_t acc[3];
@@ -461,22 +610,75 @@ void SampleTask(void*) {
             const float gy = gyr[1] / kGyrLsbPerDps;
             const float gz = gyr[2] / kGyrLsbPerDps;
 
-            const float dt = kSamplePeriodMs / 1000.0f;
-            const float acc_roll = std::atan2(ay, az) * kRadToDeg;
-            const float acc_pitch =
-                std::atan2(-ax, std::sqrt(ay * ay + az * az)) * kRadToDeg;
+            // —— 第 0 帧：用加速度把姿态直接对齐，倾斜不用等收敛 ——
+            if (!aligned) {
+                const float up[3] = {ax, ay, az};
+                q = QuatAlignUp(up);
+                q_zero = q;
+                aligned = true;
+            }
 
-            roll = kComplementaryAlpha * (roll + gx * dt) +
-                   (1.0f - kComplementaryAlpha) * acc_roll;
-            pitch = kComplementaryAlpha * (pitch + gy * dt) +
-                    (1.0f - kComplementaryAlpha) * acc_pitch;
-            if (std::fabs(gz) > kYawDeadbandDps) {
-                yaw += gz * dt;
+            // —— 第 1 步：预测。陀螺读数 + 零偏估计 = 实际角速度 ——
+            float corr[3] = {gx + gyro_bias[0], gy + gyro_bias[1], gz + gyro_bias[2]};
+
+            // —— 第 2 步：重力校正 ——
+            // 只在「几乎只受重力」时才信加速度：手持晃动叠上的线加速度
+            // 会把模长顶出 1g 附近，那几帧的重力方向是错的，必须丢掉。
+            float err[3] = {0.0f, 0.0f, 0.0f};
+            const float acc_norm = std::sqrt(ax * ax + ay * ay + az * az);
+            bool acc_ok = (acc_norm > kAccGateLow && acc_norm < kAccGateHigh);
+            if (acc_ok) {
+                const float world_up[3] = {0.0f, 0.0f, 1.0f};
+                float k[3];
+                QuatRotateInv(q, world_up, k);      // 估计的"上"在机体系
+                const float inv = 1.0f / acc_norm;
+                const float a[3] = {ax * inv, ay * inv, az * inv};
+                // 误差 = k × â。符号取负：叉积方向是把 k 转向 â 的轴，
+                // 而我们是要把估计转回去，所以叠加时取反。
+                err[0] = k[1] * a[2] - k[2] * a[1];
+                err[1] = k[2] * a[0] - k[0] * a[2];
+                err[2] = k[0] * a[1] - k[1] * a[0];
+                for (int i = 0; i < 3; i++) {
+                    corr[i] -= err[i] * kAccWeight;
+                }
             }
-            if (seq == 0) {
-                roll = acc_roll;
-                pitch = acc_pitch;
+
+            // —— 第 3 步：零偏积分。只在慢速时学，机动时会把转动学成零偏 ——
+            const float spin = std::sqrt(corr[0] * corr[0] + corr[1] * corr[1] +
+                                         corr[2] * corr[2]);
+            if (acc_ok && spin < kMaxRateToLearnBiasDps) {
+                for (int i = 0; i < 3; i++) {
+                    gyro_bias[i] += -err[i] * kAccWeight * kGyroBiasWeight * dt * kRadToDeg;
+                    if (gyro_bias[i] > kGyroBiasMaxDps) gyro_bias[i] = kGyroBiasMaxDps;
+                    if (gyro_bias[i] < -kGyroBiasMaxDps) gyro_bias[i] = -kGyroBiasMaxDps;
+                }
             }
+
+            // 航向死区：静止时陀螺残余零偏会让 yaw 一直爬
+            if (std::fabs(corr[2]) < kYawDeadbandDps) {
+                corr[2] = 0.0f;
+            }
+
+            // —— 第 4 步：把角速度积进四元数（右乘，机体系增量） ——
+            const float rv[3] = {corr[0] * dt, corr[1] * dt, corr[2] * dt};
+            q = QuatNormalize(QuatMul(q, QuatFromRotVec(rv)));
+
+            // 零点请求：在滤波器状态更新后取，保证 q_zero 与 q 同一时刻
+            if (g_zero_request) {
+                g_zero_request = false;
+                q_zero = q;
+                ESP_LOGI(kTag, "零点已更新（四元数 w=%.3f）", q_zero.w);
+            }
+
+            // —— 输出：欧拉角给日志看，倾角走零点机体系下的旋转向量 ——
+            float roll = 0.0f, pitch = 0.0f, yaw = 0.0f;
+            QuatToEuler(q, &roll, &pitch, &yaw);
+
+            Quat q_rel = QuatMul({q_zero.w, -q_zero.x, -q_zero.y, -q_zero.z}, q);
+            float rel[3];
+            QuatToRotVec(q_rel, rel);
+            const float tilt_x = rel[0] * kRadToDeg;
+            const float tilt_y = rel[1] * kRadToDeg;
 
             ImuReadout snap;
             snap.ready = true;
@@ -484,6 +686,7 @@ void SampleTask(void*) {
             for (int i = 0; i < 3; i++) {
                 snap.acc_lsb[i] = acc[i];
                 snap.gyr_lsb[i] = gyr[i];
+                snap.gyro_bias[i] = gyro_bias[i];
             }
             snap.acc_g[0] = ax;
             snap.acc_g[1] = ay;
@@ -491,15 +694,19 @@ void SampleTask(void*) {
             snap.gyr_dps[0] = gx;
             snap.gyr_dps[1] = gy;
             snap.gyr_dps[2] = gz;
+            snap.q[0] = q.w;
+            snap.q[1] = q.x;
+            snap.q[2] = q.y;
+            snap.q[3] = q.z;
             snap.roll = roll;
             snap.pitch = pitch;
             snap.yaw = yaw;
+            snap.tilt_x = tilt_x;
+            snap.tilt_y = tilt_y;
             snap.seq = seq + 1;
             snap.sample_hz = static_cast<uint16_t>(1000 / kSamplePeriodMs);
 
             portENTER_CRITICAL(&g_mux);
-            snap.tilt_x = roll - g_roll_zero;
-            snap.tilt_y = pitch - g_pitch_zero;
             g_latest = snap;
             portEXIT_CRITICAL(&g_mux);
 
@@ -525,7 +732,7 @@ void SampleTask(void*) {
 
 }  // namespace
 
-namespace Bmi270Imu {
+namespace Bmi260Imu {
 
 bool Start(i2c_master_bus_handle_t bus, uint8_t addr) {
     if (g_started) {
@@ -606,8 +813,9 @@ bool Start(i2c_master_bus_handle_t bus, uint8_t addr) {
         return false;
     }
 
-    ESP_LOGI(kTag, "就绪：100Hz ±4g/±500dps，互补滤波 alpha=%.2f",
-             kComplementaryAlpha);
+    ESP_LOGI(kTag,
+             "就绪：100Hz ±4g/±500dps，四元数互补滤波（acc=%.2f bias=%.2f 限幅±%.1fdps）",
+             kAccWeight, kGyroBiasWeight, kGyroBiasMaxDps);
     return true;
 }
 
@@ -622,13 +830,13 @@ bool GetLatest(ImuReadout* out) {
 }
 
 void Zero() {
-    portENTER_CRITICAL(&g_mux);
-    g_roll_zero = g_latest.roll;
-    g_pitch_zero = g_latest.pitch;
-    const float rx = g_roll_zero;
-    const float px = g_pitch_zero;
-    portEXIT_CRITICAL(&g_mux);
-    ESP_LOGI(kTag, "零点标定：roll=%+.1f° pitch=%+.1f°", rx, px);
+    // 真正取零点的是采样任务（它持有滤波器状态）。这里只置位，
+    // 下一帧（≤10ms）生效，误差可以忽略，换来的是不用跨任务抢四元数。
+    if (!g_started) {
+        ESP_LOGW(kTag, "IMU 未启动，忽略零点请求");
+        return;
+    }
+    g_zero_request = true;
 }
 
 void SetSerialLog(bool on) {
@@ -658,13 +866,16 @@ int FormatJson(char* buf, size_t len) {
             "{\"ready\":true,\"chip_id\":%u,\"mode\":\"%s\",\"hz\":%u,\"seq\":%lu,"
             "\"acc_g\":[%.4f,%.4f,%.4f],\"gyr_dps\":[%.2f,%.2f,%.2f],"
             "\"acc_lsb\":[%d,%d,%d],"
+            "\"q\":[%.4f,%.4f,%.4f,%.4f],\"gbias\":[%.2f,%.2f,%.2f],"
             "\"roll\":%.2f,\"pitch\":%.2f,\"yaw\":%.2f,"
             "\"tilt_x\":%.2f,\"tilt_y\":%.2f}",
             static_cast<unsigned>(r.chip_id), g_mode,
             static_cast<unsigned>(r.sample_hz),
             static_cast<unsigned long>(r.seq), r.acc_g[0], r.acc_g[1], r.acc_g[2],
             r.gyr_dps[0], r.gyr_dps[1], r.gyr_dps[2], r.acc_lsb[0], r.acc_lsb[1],
-            r.acc_lsb[2], r.roll, r.pitch, r.yaw, r.tilt_x, r.tilt_y);
+            r.acc_lsb[2], r.q[0], r.q[1], r.q[2], r.q[3],
+            r.gyro_bias[0], r.gyro_bias[1], r.gyro_bias[2],
+            r.roll, r.pitch, r.yaw, r.tilt_x, r.tilt_y);
     }
     if (n < 0) {
         return 0;
@@ -672,4 +883,4 @@ int FormatJson(char* buf, size_t len) {
     return (static_cast<size_t>(n) < len) ? n : static_cast<int>(len - 1);
 }
 
-}  // namespace Bmi270Imu
+}  // namespace Bmi260Imu

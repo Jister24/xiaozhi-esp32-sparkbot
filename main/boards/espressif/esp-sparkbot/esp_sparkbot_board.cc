@@ -1,5 +1,5 @@
 #include "application.h"
-#include "bmi270_imu.h"
+#include "bmi260_imu.h"
 #include "button.h"
 #include "codecs/es8311_audio_codec.h"
 #include "chassis_battery.h"
@@ -245,10 +245,10 @@ private:
     // 必须在 InitializeI2c() 之后调，且放在音频/摄像头初始化之后——那些组件
     // 构造时也在摸总线，串行着来最省心。
     void InitializeImu() {
-        if (!Bmi270Imu::Start(i2c_bus_)) {
+        if (!Bmi260Imu::Start(i2c_bus_)) {
             // 传感器没焊或不通不该拦着整机启动，语音和遥控照常能用。
             ESP_LOGW("SparkBot", "IMU 初始化失败(err=%d)，体感功能不可用",
-                     Bmi270Imu::LastInitError());
+                     Bmi260Imu::LastInitError());
         }
     }
 
@@ -737,11 +737,11 @@ public:
                           // 体感游戏靠 GET /imu 取数，/imu/zero 现标现用。
                           // 机器人放桌上不一定水平，所以零点必须能重标。
                           []() {
-                              char buf[360];
-                              Bmi270Imu::FormatJson(buf, sizeof(buf));
+                              char buf[448];
+                              Bmi260Imu::FormatJson(buf, sizeof(buf));
                               return std::string(buf);
                           },
-                          []() { Bmi270Imu::Zero(); });
+                          []() { Bmi260Imu::Zero(); });
 
         StartSleepFaceTask();  // 低功耗时打睡脸，见 UpdateSleepFace
 
