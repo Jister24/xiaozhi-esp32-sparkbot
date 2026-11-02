@@ -1,4 +1,5 @@
 #include "application.h"
+#include "bmi270_imu.h"
 #include "button.h"
 #include "codecs/es8311_audio_codec.h"
 #include "chassis_battery.h"
@@ -237,6 +238,18 @@ private:
                 },
         };
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
+    }
+
+    // BMI270 六轴 IMU，和 ES8311、摄像头 SCCB 共用上面这条 I2C（地址 0x68）。
+    // 官方固件从来不读它，这里起 100Hz 采样给体感游戏用。
+    // 必须在 InitializeI2c() 之后调，且放在音频/摄像头初始化之后——那些组件
+    // 构造时也在摸总线，串行着来最省心。
+    void InitializeImu() {
+        if (!Bmi270Imu::Start(i2c_bus_)) {
+            // 传感器没焊或不通不该拦着整机启动，语音和遥控照常能用。
+            ESP_LOGW("SparkBot", "IMU 初始化失败(err=%d)，体感功能不可用",
+                     Bmi270Imu::LastInitError());
+        }
     }
 
     void InitializeSpi() {
@@ -698,6 +711,7 @@ public:
         InitializeCamera();
         InitializeEchoUart();
         InitializeBattery();
+        InitializeImu();
         InitializeTools();
         // LOCAL_CONTROL_PATCH: 在板级完成 UART 与摄像头初始化后，起局域网遥控服务。
         // lambda 捕获 this 以复用 private 的 SendUartMessage，无需开放可见性。
@@ -719,7 +733,15 @@ public:
                               percent = chassis_battery_.Percent();
                               charging = chassis_battery_.IsCharging();
                               return true;
-                          });
+                          },
+                          // 体感游戏靠 GET /imu 取数，/imu/zero 现标现用。
+                          // 机器人放桌上不一定水平，所以零点必须能重标。
+                          []() {
+                              char buf[360];
+                              Bmi270Imu::FormatJson(buf, sizeof(buf));
+                              return std::string(buf);
+                          },
+                          []() { Bmi270Imu::Zero(); });
 
         StartSleepFaceTask();  // 低功耗时打睡脸，见 UpdateSleepFace
 

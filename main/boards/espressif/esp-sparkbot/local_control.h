@@ -20,11 +20,21 @@
 // battery_provider 可选，注入后 /status 会带上主体板电池信息。
 // chassis_battery_provider 可选，注入后 /status 会带 chassis_* 前缀的底盘电池信息；
 // 底盘电池在 C2 那一侧采样，主体板只能通过 UART 问来，问不到就省略字段。
+//
+// imu_provider 可选，注入后多出两个端点：
+//   GET /imu       返回 IMU 当前读数（JSON），体感游戏和标定脚本都用它
+//   GET /imu/zero  把当前姿态记为零点
+// 这里只收 JSON 字符串而不是具体结构体，是为了让 local_control 不必知道
+// IMU 的字段含义——驱动改了字段不用动这个文件。
 using BatteryProvider = std::function<bool(int& cell_mv, int& percent, bool& charging)>;
+using ImuProvider = std::function<std::string()>;
+using ImuZeroAction = std::function<void()>;
 
 void LocalControlStart(std::function<void(const char*)> send_command,
                        BatteryProvider battery_provider = nullptr,
-                       BatteryProvider chassis_battery_provider = nullptr);
+                       BatteryProvider chassis_battery_provider = nullptr,
+                       ImuProvider imu_provider = nullptr,
+                       ImuZeroAction imu_zero = nullptr);
 
 // 当前是否处在 Wi-Fi 省电状态，也就是「没有远程客户端在用的空闲期」。
 // 板级据此在屏幕上换成睡觉表情（见 esp_sparkbot_board.cc 的 UpdateSleepFace），

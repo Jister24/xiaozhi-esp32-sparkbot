@@ -34,6 +34,8 @@ constexpr size_t kMaxJpegBytes = 200 * 1024;
 std::function<void(const char*)> g_send;
 BatteryProvider g_battery;
 BatteryProvider g_chassis_battery;
+ImuProvider g_imu;
+ImuZeroAction g_imu_zero;
 httpd_handle_t g_ctrl_server = nullptr;
 httpd_handle_t g_cam_server = nullptr;
 SemaphoreHandle_t g_cam_lock = nullptr;
@@ -340,6 +342,29 @@ esp_err_t HandleStatus(httpd_req_t* req) {
     return ReplyJson(req, body);
 }
 
+// 体感游戏和标定脚本读这个。JSON 由驱动拼，这里只负责转发，
+// 免得 IMU 字段一改就得同步两个文件。
+esp_err_t HandleImu(httpd_req_t* req) {
+    NoteClientActivity();
+    if (!g_imu) {
+        return ReplyJson(req, "{\"ready\":false,\"err\":\"imu disabled\"}");
+    }
+    const std::string body = g_imu();
+    if (body.empty()) {
+        return ReplyJson(req, "{\"ready\":false,\"err\":\"no sample\"}");
+    }
+    return ReplyJson(req, body.c_str());
+}
+
+esp_err_t HandleImuZero(httpd_req_t* req) {
+    NoteClientActivity();
+    if (!g_imu_zero) {
+        return ReplyJson(req, "{\"ok\":false,\"err\":\"imu disabled\"}");
+    }
+    g_imu_zero();
+    return ReplyJson(req, "{\"ok\":true}");
+}
+
 // 最小可用控制台：方向键 / WASD、速度档位、实时画面
 const char* kIndexHtml = R"HTML(<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -575,6 +600,14 @@ bool StartControlServer() {
     RegisterRoute(g_ctrl_server, "/rot", HTTP_GET, HandleRot);
     RegisterRoute(g_ctrl_server, "/mirror", HTTP_GET, HandleMirror);
     RegisterRoute(g_ctrl_server, "/status", HTTP_GET, HandleStatus);
+    // 只有板级真的注入了 IMU 才挂这两个路由，没注入的板子上访问会 404，
+    // 不会返回一个误导性的 ready:false。
+    if (g_imu) {
+        RegisterRoute(g_ctrl_server, "/imu", HTTP_GET, HandleImu);
+    }
+    if (g_imu_zero) {
+        RegisterRoute(g_ctrl_server, "/imu/zero", HTTP_GET, HandleImuZero);
+    }
 
     ESP_LOGI(TAG, "control server on :%d", kCtrlPort);
     return true;
@@ -654,7 +687,9 @@ bool LocalControlPowerSaveOn() {
 
 void LocalControlStart(std::function<void(const char*)> send_command,
                        BatteryProvider battery_provider,
-                       BatteryProvider chassis_battery_provider) {
+                       BatteryProvider chassis_battery_provider,
+                       ImuProvider imu_provider,
+                       ImuZeroAction imu_zero) {
     if (g_send) {
         ESP_LOGW(TAG, "already started");
         return;
@@ -662,6 +697,8 @@ void LocalControlStart(std::function<void(const char*)> send_command,
     g_send = std::move(send_command);
     g_battery = std::move(battery_provider);
     g_chassis_battery = std::move(chassis_battery_provider);
+    g_imu = std::move(imu_provider);
+    g_imu_zero = std::move(imu_zero);
     g_boot_us = esp_timer_get_time();
     g_cam_lock = xSemaphoreCreateMutex();
     if (g_cam_lock == nullptr) {
