@@ -59,17 +59,18 @@ constexpr int kLogEveryN = 10;            // 每 10 帧一行 = 10Hz
 //   再小（0.4）：晃动期只 1.4°，但冷启动要 5.8s 才收敛——
 //   我们第一帧就用加速度对齐姿态，冷启动不靠增益，所以选偏小的 0.6。
 constexpr float kAccWeight = 0.6f;
-// 零偏学习率。0.1 时静稳误差 0.02°，再大就开始把噪声学成零偏。
-constexpr float kGyroBiasWeight = 0.1f;
 // 零偏限幅 ±1.2dps（PX4 ATT_BIAS_MAX 是 0.05rad/s≈2.9dps）。
-// 实测这颗的零偏都在 0.2dps 以内，限太宽只会在机动时留下更大的残余。
+// 实测这颗的零偏都在 0.7dps 以内，限太宽只会在机动时留下更大的残余。
 constexpr float kGyroBiasMaxDps = 1.2f;
 // 加速度门控：只有模长落在这一带才认为「此刻只受重力」。
 // 手持晃动叠上线加速度，模长会跑出这个区间，那几帧的重力方向不可信。
 constexpr float kAccGateLow = 0.88f;
 constexpr float kAccGateHigh = 1.12f;
-// 角速度超过这个值就不学零偏，否则会把真实转动当成零偏学进去
-constexpr float kMaxRateToLearnBiasDps = 10.0f;
+// 静止判定：三轴陀螺都小于这个值。手持时最慢的抖动也有 2~3dps，
+// 留 1.5 就不会把「手稳住了但还在慢慢转」误判成静止。
+constexpr float kStillRateDps = 1.5f;
+// 连续静止这么多帧（100Hz 下 = 1 秒）才更新零偏，避免路过静止状态就抓。
+constexpr int kStillFrames = 100;
 // 静止时陀螺读数里剩下的那点偏置会让航向一直爬，低于这个值就不积分航向。
 // 代价是极慢的转向（<0.5dps）会被吃掉——摇杆用不到，可以接受。
 constexpr float kYawDeadbandDps = 0.5f;
@@ -468,13 +469,13 @@ void AppendBar(char* out, float value, float full_scale) {
 // 数值失真，② 零点不在水平面上时「角度相减」不等于相对转角，③ pitch
 // 接近 ±90° 会奇异。四元数没有这些问题，代价是几十行乘加。
 //
-// 每帧三步（dt 固定 10ms）：
+// 每帧四步（dt 固定 10ms）：
 //   1. 预测：把陀螺读数（扣掉零偏）当角速度，右乘一个增量四元数
 //   2. 校正：估计出的重力方向 k = R(q)ᵀ·(0,0,1) 与实测 â 叉乘得到误差，
 //      以 kAccWeight 的比例加进角速度——这就是「互补」的那一半
-//   3. 零偏：把校正量按 kGyroBiasWeight 积分进零偏并限幅。陀螺读数偏高时
-//      估计会跑在前面，校正量指向反方向，积分出的零偏正好把它抵消。
-//      只在慢速时做，机动时学会把真实转动当零偏。
+//   3. 零偏：只在确认静止 1 秒后，直接把当前陀螺读数取反当零偏。
+//      PX4 那种「按校正量积分」的做法在这里会跑飞，原因见该处注释。
+//   4. 航向死区：低于 kYawDeadbandDps 的 z 轴角速度不积分
 // ===========================================================================
 
 struct Quat {
@@ -525,27 +526,11 @@ Quat QuatFromRotVec(const float rv[3]) {
     return {std::cos(half), rv[0] * s, rv[1] * s, rv[2] * s};
 }
 
-// 四元数 → 旋转向量（弧度）。取短弧（w<0 先取反），否则 180° 附近会跳。
-void QuatToRotVec(Quat q, float rv[3]) {
-    if (q.w < 0.0f) {
-        q.w = -q.w;
-        q.x = -q.x;
-        q.y = -q.y;
-        q.z = -q.z;
-    }
-    const float w = q.w > 1.0f ? 1.0f : q.w;
-    const float ang = 2.0f * std::acos(w);
-    const float s = std::sqrt(std::fmax(0.0f, 1.0f - w * w));
-    if (s < 1e-6f) {
-        // 转角接近 0 或 180°，此时不能除以 sin，直接用小角近似
-        rv[0] = 2.0f * q.x;
-        rv[1] = 2.0f * q.y;
-        rv[2] = 2.0f * q.z;
-        return;
-    }
-    rv[0] = q.x / s * ang;
-    rv[1] = q.y / s * ang;
-    rv[2] = q.z / s * ang;
+// 角度差归一到 ±180°。零点存的是绝对角，两者相减在 ±180 附近会跳。
+float WrapDeg(float d) {
+    while (d > 180.0f) d -= 360.0f;
+    while (d < -180.0f) d += 360.0f;
+    return d;
 }
 
 // 冷启动对齐：找到一个旋转，把实测「上」方向转到世界系 z 轴。
@@ -576,12 +561,19 @@ Quat QuatAlignUp(const float up[3]) {
     return {std::cos(half), ax * s, ay * s, az * s};
 }
 
+// 欧拉角（度）。roll / pitch 等价于「重力在机体系的方向」——
+//   roll  = atan2(u_y, u_z)，pitch = atan2(-u_x, √(u_y²+u_z²))
+// 其中 u = R(q)ᵀ·(0,0,1) 是重力在机体系的方向。写成下面这种形式只是
+// 省一次矩阵乘，两者在数学上完全一样。
+// pitch 用 atan2 而不是 asin(2(wy-zx))：asin 在 ±90° 附近抖，且过了
+// ±90° 会折回来，倾角输出靠这两个角，不能留这种坑。
 void QuatToEuler(const Quat& q, float* roll, float* pitch, float* yaw) {
     const float w = q.w, x = q.x, y = q.y, z = q.z;
-    *roll = std::atan2(2.0f * (w * x + y * z), 1.0f - 2.0f * (x * x + y * y)) * kRadToDeg;
-    float sp = 2.0f * (w * y - z * x);
-    sp = sp > 1.0f ? 1.0f : (sp < -1.0f ? -1.0f : sp);
-    *pitch = std::asin(sp) * kRadToDeg;
+    const float uy = 2.0f * (y * z + w * x);          // 重力的机体系 y 分量
+    const float uz = 1.0f - 2.0f * (x * x + y * y);   // 重力的机体系 z 分量
+    const float ux = 2.0f * (x * z - w * y);          // 重力的机体系 x 分量
+    *roll = std::atan2(uy, uz) * kRadToDeg;
+    *pitch = std::atan2(-ux, std::sqrt(uy * uy + uz * uz)) * kRadToDeg;
     *yaw = std::atan2(2.0f * (w * z + x * y), 1.0f - 2.0f * (y * y + z * z)) * kRadToDeg;
 }
 
@@ -593,8 +585,12 @@ void SampleTask(void*) {
 
     // 滤波器状态：全部是本任务私有的，共享只通过 g_latest / g_zero_request
     Quat q{1.0f, 0.0f, 0.0f, 0.0f};
-    Quat q_zero{1.0f, 0.0f, 0.0f, 0.0f};
+    // 零点默认「水平面」= 不改任何东西，tilt 就从开机起等于绝对倾角。
+    // 要改成手持中性位就调 Zero()，那时才写入这两个角。
+    float roll_zero = 0.0f;
+    float pitch_zero = 0.0f;
     float gyro_bias[3] = {0.0f, 0.0f, 0.0f};   // dps
+    int still_cnt = 0;                          // 连续静止帧数
     bool aligned = false;
     const float dt = kSamplePeriodMs / 1000.0f;
 
@@ -611,11 +607,14 @@ void SampleTask(void*) {
             const float gz = gyr[2] / kGyrLsbPerDps;
 
             // —— 第 0 帧：用加速度把姿态直接对齐，倾斜不用等收敛 ——
+            // 只对齐姿态，不动零点：零点默认就是水平面（roll/pitch 都为 0）。
+            // 这里顺手把零点也设成本帧的话，tilt 就变成「相对开机摆法」，
+            // 同一个物理姿势开两次机读数不同，没法当标定基准。
             if (!aligned) {
                 const float up[3] = {ax, ay, az};
                 q = QuatAlignUp(up);
-                q_zero = q;
                 aligned = true;
+                ESP_LOGI(kTag, "姿态已对齐，零点 = 水平面（要改成手持中性位请调 /imu/zero）");
             }
 
             // —— 第 1 步：预测。陀螺读数 + 零偏估计 = 实际角速度 ——
@@ -638,20 +637,40 @@ void SampleTask(void*) {
                 err[0] = k[1] * a[2] - k[2] * a[1];
                 err[1] = k[2] * a[0] - k[0] * a[2];
                 err[2] = k[0] * a[1] - k[1] * a[0];
+                // ★ 必须乘 kRadToDeg：err 是「单位误差的角速度」，量纲是 rad/s；
+                // 而 corr 里装的是陀螺读数，量纲是 dps。少乘这一步，校正强度
+                // 只有设计值的 1/57.3，滤波器几乎纯靠陀螺积分——姿态跟加速度计
+                // 差着好几度、收敛慢几十倍，而代码看上去完全正常。
                 for (int i = 0; i < 3; i++) {
-                    corr[i] -= err[i] * kAccWeight;
+                    corr[i] -= err[i] * kAccWeight * kRadToDeg;
                 }
             }
 
-            // —— 第 3 步：零偏积分。只在慢速时学，机动时会把转动学成零偏 ——
-            const float spin = std::sqrt(corr[0] * corr[0] + corr[1] * corr[1] +
-                                         corr[2] * corr[2]);
-            if (acc_ok && spin < kMaxRateToLearnBiasDps) {
+            // —— 第 3 步：零偏。只做「静止时直接抓」，不做在线积分学习 ——
+            //
+            // 曾经按 PX4 的思路用校正量积分去学零偏（attitude_estimator_q 的
+            // ATT_W_GYRO_BIAS），实机跑 50 秒就把三轴全都顶到 ±1.2dps 限幅：
+            // 手持慢速倾斜只有十几 dps，会被当成零偏学进去，然后往积分里灌
+            // 1.2dps 的假角速度，12 秒积出 14°，倾角直接错 18°。
+            // 而且 x/y 的零偏本来就被重力校正钉死了，学它没有收益；z 轴
+            // （航向）重力观测不到，也学不出来。所以干脆不学。
+            //
+            // 真正有用的是「静止时把当前陀螺读数当零偏」：手放着不动一秒，
+            // gz 立刻归零，航向漂移从根上没了，比死区干净。
+            const bool still = acc_ok && std::fabs(gx) < kStillRateDps &&
+                               std::fabs(gy) < kStillRateDps &&
+                               std::fabs(gz) < kStillRateDps;
+            still_cnt = still ? still_cnt + 1 : 0;
+            if (still_cnt == kStillFrames) {
+                gyro_bias[0] = -gx;   // 积分里用的是 gx + bias，所以取负
+                gyro_bias[1] = -gy;
+                gyro_bias[2] = -gz;
                 for (int i = 0; i < 3; i++) {
-                    gyro_bias[i] += -err[i] * kAccWeight * kGyroBiasWeight * dt * kRadToDeg;
                     if (gyro_bias[i] > kGyroBiasMaxDps) gyro_bias[i] = kGyroBiasMaxDps;
                     if (gyro_bias[i] < -kGyroBiasMaxDps) gyro_bias[i] = -kGyroBiasMaxDps;
                 }
+                ESP_LOGI(kTag, "静止 1s，零偏更新 %+.2f %+.2f %+.2f dps",
+                         gyro_bias[0], gyro_bias[1], gyro_bias[2]);
             }
 
             // 航向死区：静止时陀螺残余零偏会让 yaw 一直爬
@@ -663,22 +682,27 @@ void SampleTask(void*) {
             const float rv[3] = {corr[0] * dt, corr[1] * dt, corr[2] * dt};
             q = QuatNormalize(QuatMul(q, QuatFromRotVec(rv)));
 
-            // 零点请求：在滤波器状态更新后取，保证 q_zero 与 q 同一时刻
-            if (g_zero_request) {
-                g_zero_request = false;
-                q_zero = q;
-                ESP_LOGI(kTag, "零点已更新（四元数 w=%.3f）", q_zero.w);
-            }
-
-            // —— 输出：欧拉角给日志看，倾角走零点机体系下的旋转向量 ——
+            // —— 输出：欧拉角给日志看，倾角是「相对零点的 roll/pitch 差」 ——
             float roll = 0.0f, pitch = 0.0f, yaw = 0.0f;
             QuatToEuler(q, &roll, &pitch, &yaw);
 
-            Quat q_rel = QuatMul({q_zero.w, -q_zero.x, -q_zero.y, -q_zero.z}, q);
-            float rel[3];
-            QuatToRotVec(q_rel, rel);
-            const float tilt_x = rel[0] * kRadToDeg;
-            const float tilt_y = rel[1] * kRadToDeg;
+            // 零点请求放在算完欧拉角之后：零点要同时记住姿态角。
+            if (g_zero_request) {
+                g_zero_request = false;
+                roll_zero = roll;
+                pitch_zero = pitch;
+                ESP_LOGI(kTag, "零点已更新：roll=%+.1f° pitch=%+.1f°", roll_zero, pitch_zero);
+            }
+
+            // 倾角为什么不用「q_rel 的旋转向量 x/y 分量」？
+            // 因为那个量含 yaw：手腕一边倾一边拧（绕竖直轴自转），重力方向
+            // 只转了 39°，旋转向量却涨到 59°——实测直接过读 20°。
+            // 而 roll / pitch 是由「重力在机体系的方向」定义的：绕竖直轴自转
+            // 不改变重力在机体系的方向，所以这两个角对 yaw 天然免疫。
+            // 代价是两个轴同时倾很大时，向量和会比真实转角略大（30~40° 时
+            // 约 1°，极端斜角最多 9°），比 20° 的 yaw 污染小一个量级。
+            const float tilt_x = WrapDeg(roll - roll_zero);
+            const float tilt_y = WrapDeg(pitch - pitch_zero);
 
             ImuReadout snap;
             snap.ready = true;
@@ -814,8 +838,8 @@ bool Start(i2c_master_bus_handle_t bus, uint8_t addr) {
     }
 
     ESP_LOGI(kTag,
-             "就绪：100Hz ±4g/±500dps，四元数互补滤波（acc=%.2f bias=%.2f 限幅±%.1fdps）",
-             kAccWeight, kGyroBiasWeight, kGyroBiasMaxDps);
+             "就绪：100Hz ±4g/±500dps，四元数互补滤波（acc=%.2f，零偏静止抓取±%.1fdps）",
+             kAccWeight, kGyroBiasMaxDps);
     return true;
 }
 

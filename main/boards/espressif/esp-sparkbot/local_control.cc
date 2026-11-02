@@ -575,7 +575,12 @@ bool RegisterRoute(httpd_handle_t server, const char* uri, httpd_method_t method
     route.method = method;
     route.handler = handler;
     route.user_ctx = nullptr;
-    return httpd_register_uri_handler(server, &route) == ESP_OK;
+    const esp_err_t err = httpd_register_uri_handler(server, &route);
+    if (err != ESP_OK) {
+        // 别吞掉：handler 数量超上限、URI 重复都会走到这里，而对外表现都只是 404
+        ESP_LOGE("local_ctrl", "注册路由 %s 失败：%s", uri, esp_err_to_name(err));
+    }
+    return err == ESP_OK;
 }
 
 bool StartControlServer() {
@@ -587,6 +592,10 @@ bool StartControlServer() {
     // 默认 4 个槽位在「隧道 + 本地」并存时会被占满，新连接直接被拒（表现为设备离线）。
     config.max_open_sockets = 6;
     config.lru_purge_enable = true;
+    // 默认只给 8 个 URI handler，而下面一共注册 9 个。第 9 个会静默注册失败
+    // ——HTTP 直接 404，没有任何日志，看起来就像「这个端点没实现」。
+    // /imu/zero 就是这么丢的。以后再加端点也不用回来改这里。
+    config.max_uri_handlers = 16;
 
     if (httpd_start(&g_ctrl_server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "control server start failed");
