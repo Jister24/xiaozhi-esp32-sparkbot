@@ -3,6 +3,7 @@
 //
 // 来源：linux-firmware 仓库的 bmi260-init-data.fw
 //   https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git
+//   sha256: cf0527e2a34aaf3acfdf5ca539cfb47c2381693d064b49d1479ebcfab0cca377
 //
 // BMI260 上电后处于 suspend，且加速度/陀螺默认不输出数据，必须把这 8KB
 // 配置写进芯片内部 RAM 才会工作。这段数据与 BMI270 的 config file 不同
