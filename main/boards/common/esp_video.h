@@ -70,6 +70,8 @@ public:
 private:
     void RotateFrame180();
     void MirrorFrameHorizontal();
+    // 缩放后固定是 RGB565，单独给录制模式用的小图旋转
+    static void RotateRgb565Frame180(uint8_t* data, size_t len);
     bool rotate180_ = true;
     bool mirror_h_ = false;
 
@@ -114,4 +116,7 @@ public:
 private:
     CapturePerf perf_;
     bool skip_preview_ = false;
+    // 录制模式下 180° 旋转推迟到降采样之后做：640x480 转一次 37ms，
+    // 320x240 只要约 9ms，省下来的时间直接变成帧率。
+    bool skip_rotate_ = false;
 };

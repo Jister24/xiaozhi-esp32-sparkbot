@@ -416,12 +416,21 @@ void EspVideo::SetExplainUrl(const std::string& url, const std::string& token) {
 // image_to_jpeg_cb 编码，保证两条链路走的是同一份画质参数。
 bool EspVideo::GetJpegFrame(std::vector<uint8_t>& out) {
     out.clear();
-    // CAMERA_PERF_PROBE: 图传期间不刷 LCD 预览，退出时自动恢复
-    struct PreviewGuard {
-        bool* flag;
-        explicit PreviewGuard(bool* f) : flag(f) { *flag = true; }
-        ~PreviewGuard() { *flag = false; }
-    } preview_guard(&skip_preview_);
+    // CAMERA_PERF_PROBE: 图传期间不刷 LCD 预览；录制模式下 180° 旋转推迟到
+    // 降采样之后做（640x480 转一次 37ms，320x240 只要约 9ms）。
+    // 两者都在退出时自动恢复，包括中途 return 的分支。
+    struct CaptureGuards {
+        bool* preview;
+        bool* rotate;
+        CaptureGuards(bool* p, bool* r, bool defer_rotate) : preview(p), rotate(r) {
+            *preview = true;
+            *rotate = defer_rotate;
+        }
+        ~CaptureGuards() {
+            *preview = false;
+            *rotate = false;
+        }
+    } guards(&skip_preview_, &skip_rotate_, recording_mode_);
     // CAMERA_PERF_PROBE: 从取帧到 JPEG 编码完成的全链路计时
     const int64_t t_all_start = esp_timer_get_time();
     if (!Capture()) {
@@ -440,12 +449,20 @@ bool EspVideo::GetJpegFrame(std::vector<uint8_t>& out) {
     v4l2_pix_fmt_t enc_fmt = frame_.format;
     // CAMERA_MODE_SWITCH: 录制模式先把整帧降到 320x240，编码量只剩 1/4
     const int64_t t_scale0 = esp_timer_get_time();
-    if (recording_mode_ && ScaleFrameTo(320, 240)) {
-        enc_src = scale_buf_.data();
-        enc_len = static_cast<size_t>(320) * 240 * 2;
-        enc_fmt = V4L2_PIX_FMT_RGB565;
-        width = 320;
-        height = 240;
+    if (recording_mode_) {
+        if (ScaleFrameTo(320, 240)) {
+            enc_src = scale_buf_.data();
+            enc_len = static_cast<size_t>(320) * 240 * 2;
+            enc_fmt = V4L2_PIX_FMT_RGB565;
+            width = 320;
+            height = 240;
+            // 旋转推迟到这里：小图上做，成本只有 1/4
+            if (rotate180_) {
+                RotateRgb565Frame180(enc_src, enc_len);
+            }
+        } else if (rotate180_) {
+            RotateFrame180();  // 缩放失败就退回全尺寸旋转，至少方向是对的
+        }
     }
     perf_.scale_us = esp_timer_get_time() - t_scale0;
     bool ok = image_to_jpeg_cb(
@@ -527,6 +544,20 @@ bool EspVideo::ScaleFrameTo(uint16_t dst_w, uint16_t dst_h) {
         return false;
     }
     return true;
+}
+
+// 缩放后的图固定是 RGB565，这里只处理这种情况，比通用版少一层 switch。
+void EspVideo::RotateRgb565Frame180(uint8_t* data, size_t len) {
+    if (data == nullptr || len < 4) {
+        return;
+    }
+    auto* pixels = reinterpret_cast<uint16_t*>(data);
+    size_t count = len / 2;
+    for (size_t i = 0, j = count - 1; i < j; ++i, --j) {
+        uint16_t tmp = pixels[i];
+        pixels[i] = pixels[j];
+        pixels[j] = tmp;
+    }
 }
 
 bool EspVideo::SetRecordingMode(bool recording) {
@@ -1087,7 +1118,7 @@ bool EspVideo::Capture() {
 
     // LOCAL_CONTROL_PATCH: 传感器倒装，预览/编码前先整帧转正。
 #if !defined(CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE)
-    if (rotate180_) {
+    if (rotate180_ && !skip_rotate_) {
         RotateFrame180();
     }
 #endif
