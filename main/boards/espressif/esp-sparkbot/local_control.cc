@@ -556,7 +556,8 @@ esp_err_t HandleStream(httpd_req_t* req) {
             break;
         }
         // 约 4~5 fps，兼顾流畅度与 A/V 主链路的 CPU 余量
-        vTaskDelay(pdMS_TO_TICKS(60));
+        // CAMERA_PERF_PROBE: 60ms 固定节流是实测帧率的主要天花板，先去掉看纯上限
+        vTaskDelay(pdMS_TO_TICKS(0));
     }
     g_stream_clients--;
     ESP_LOGI(TAG, "stream client disconnected, active=%d", g_stream_clients);

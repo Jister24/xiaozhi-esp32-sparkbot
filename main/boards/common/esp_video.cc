@@ -1,6 +1,7 @@
 #include "sdkconfig.h"
 
 #include <esp_heap_caps.h>
+#include <esp_timer.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -415,10 +416,19 @@ void EspVideo::SetExplainUrl(const std::string& url, const std::string& token) {
 // image_to_jpeg_cb 编码，保证两条链路走的是同一份画质参数。
 bool EspVideo::GetJpegFrame(std::vector<uint8_t>& out) {
     out.clear();
+    // CAMERA_PERF_PROBE: 图传期间不刷 LCD 预览，退出时自动恢复
+    struct PreviewGuard {
+        bool* flag;
+        explicit PreviewGuard(bool* f) : flag(f) { *flag = true; }
+        ~PreviewGuard() { *flag = false; }
+    } preview_guard(&skip_preview_);
+    // CAMERA_PERF_PROBE: 从取帧到 JPEG 编码完成的全链路计时
+    const int64_t t_all_start = esp_timer_get_time();
     if (!Capture()) {
         ESP_LOGE(TAG, "GetJpegFrame: capture failed");
         return false;
     }
+    const int64_t t_capture_done = esp_timer_get_time();
     if (frame_.data == nullptr || frame_.len == 0) {
         ESP_LOGE(TAG, "GetJpegFrame: empty frame");
         return false;
@@ -440,6 +450,22 @@ bool EspVideo::GetJpegFrame(std::vector<uint8_t>& out) {
         ESP_LOGE(TAG, "GetJpegFrame: jpeg encode failed");
         out.clear();
         return false;
+    }
+    perf_.jpeg_us = esp_timer_get_time() - t_capture_done;
+    perf_.total_us = esp_timer_get_time() - t_all_start;
+    perf_.jpeg_len = out.size();
+    // 每 5 帧打一行，够定位瓶颈又不刷屏
+    static int perf_log_counter = 0;
+    if (++perf_log_counter % 5 == 1) {
+        ESP_LOGI(TAG,
+                 "perf %ux%u raw=%uKB jpeg=%uKB | dbuf %lld | rotate %lld | display %lld | jpeg "
+                 "%lld | capture %lld | total %lld ms",
+                 (unsigned)perf_.width, (unsigned)perf_.height, (unsigned)(perf_.raw_len / 1024),
+                 (unsigned)(perf_.jpeg_len / 1024), (long long)(perf_.dbuf_us / 1000),
+                 (long long)(perf_.rotate_us / 1000), (long long)(perf_.display_us / 1000),
+                 (long long)(perf_.jpeg_us / 1000),
+                 (long long)((t_capture_done - t_all_start) / 1000),
+                 (long long)(perf_.total_us / 1000));
     }
     return !out.empty();
 }
@@ -622,6 +648,8 @@ void EspVideo::MirrorFrameHorizontal() {
 }
 
 bool EspVideo::Capture() {
+    // CAMERA_PERF_PROBE: 分段计时起点
+    const int64_t t_probe_start = esp_timer_get_time();
     if (encoder_thread_.joinable()) {
         encoder_thread_.join();
     }
@@ -632,7 +660,9 @@ bool EspVideo::Capture() {
         return false;
     }
 
-    for (int i = 0; i < 3; i++) {
+    // CAMERA_PERF_PROBE: 原来循环 3 次只保留第 3 帧，前两帧纯丢弃，
+    // 在 15fps 传感器上白等 130ms。直接取当下这一帧即可。
+    for (int i = 0; i < 1; i++) {
         struct v4l2_buffer buf = {};
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buf.memory = V4L2_MEMORY_MMAP;
@@ -640,7 +670,7 @@ bool EspVideo::Capture() {
             ESP_LOGE(TAG, "VIDIOC_DQBUF failed");
             return false;
         }
-        if (i == 2) {
+        if (i == 0) {
             // 保存帧副本到PSRAM
             if (frame_.data) {
                 heap_caps_free(frame_.data);
@@ -983,6 +1013,10 @@ bool EspVideo::Capture() {
         }
     }
 
+    // CAMERA_PERF_PROBE: DQBUF x3 + PSRAM 拷贝 + 字节序转换
+    const int64_t t_probe_loop = esp_timer_get_time();
+    perf_.dbuf_us = t_probe_loop - t_probe_start;
+
     // LOCAL_CONTROL_PATCH: 传感器倒装，预览/编码前先整帧转正。
 #if !defined(CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE)
     if (rotate180_) {
@@ -995,9 +1029,13 @@ bool EspVideo::Capture() {
         MirrorFrameHorizontal();
     }
 
+    // CAMERA_PERF_PROBE: 180° 旋转 + 水平镜像
+    const int64_t t_probe_rot = esp_timer_get_time();
+    perf_.rotate_us = t_probe_rot - t_probe_loop;
+
     // 显示预览图片
     auto display = Board::GetInstance().GetDisplay();
-    if (display != nullptr) {
+    if (display != nullptr && !skip_preview_) {
         if (!frame_.data) {
             ESP_LOGE(TAG, "frame.data is null");
             return false;
@@ -1107,6 +1145,12 @@ bool EspVideo::Capture() {
             std::make_unique<LvglAllocatedImage>(data, lvgl_image_size, w, h, stride, color_format);
         display->SetPreviewImage(std::move(image));
     }
+
+    // CAMERA_PERF_PROBE: LCD 预览刷新
+    perf_.display_us = esp_timer_get_time() - t_probe_rot;
+    perf_.width = frame_.width;
+    perf_.height = frame_.height;
+    perf_.raw_len = frame_.len;
     return true;
 }
 

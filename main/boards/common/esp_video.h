@@ -73,4 +73,26 @@ private:
     bool mirror_h_ = false;
 
 public:
+    // CAMERA_PERF_PROBE: 分段耗时探针，用于定位抓帧链路的真实瓶颈。
+    // 只在 GetJpegFrame()（局域网图传/拍照）里打点，不影响云端拍照链路。
+    struct CapturePerf {
+        int64_t dbuf_us = 0;     // DQBUF x3 + PSRAM 拷贝 + 字节序转换
+        int64_t rotate_us = 0;   // 180° 旋转 + 水平镜像
+        int64_t display_us = 0;  // LCD 预览刷新
+        int64_t jpeg_us = 0;     // 软件 JPEG 编码
+        int64_t total_us = 0;    // Capture + JPEG 全程
+        uint16_t width = 0;
+        uint16_t height = 0;
+        size_t raw_len = 0;
+        size_t jpeg_len = 0;
+    };
+    const CapturePerf& GetCapturePerf() const { return perf_; }
+
+    // CAMERA_PERF_PROBE: 局域网图传时不需要刷新 LCD 预览（屏上显示的是表情），
+    // 跳过后每帧省掉一次 600KB 分配 + 拷贝 + 刷屏。
+    void SetSkipPreview(bool skip) { skip_preview_ = skip; }
+
+private:
+    CapturePerf perf_;
+    bool skip_preview_ = false;
 };
