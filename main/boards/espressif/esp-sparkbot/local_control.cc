@@ -445,6 +445,91 @@ esp_err_t HandleNet(httpd_req_t* req) {
     return ReplyJson(req, body);
 }
 
+// ---------------------------------------------------------------------------
+// 任务 CPU 占用：量「IMU 采样到底吃多少 CPU、会不会挤到语音唤醒」
+// ---------------------------------------------------------------------------
+// sdkconfig 里 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y，每个任务都有
+// ulRunTimeCounter（32 位微秒，约 71 分钟回绕）。回绕不影响无符号差分，
+// 所以这里只算「距上一次 /tasks 请求这段时间」的占比，不做长期平均——
+// 想量某个任务，连着请求两次即可，间隔就是统计窗口。
+//
+// 输出 cpu 是千分比（0~1000），栈是历史最小剩余（字，×4 得字节）。
+// idle0 / idle1 的占比直接反映还有多少余量：两个加起来接近 1000 就说明
+// 整机大部分时间在空转，任何后台任务都没挤到关键路径。
+constexpr int kMaxTaskSnapshots = 48;
+
+struct TaskCpuSnapshot {
+    char name[16];
+    uint32_t counter;
+    uint32_t stack_words;
+};
+
+TaskCpuSnapshot g_task_prev[kMaxTaskSnapshots];
+int g_task_prev_count = 0;
+int64_t g_task_prev_us = 0;
+
+const TaskCpuSnapshot* FindPrevSnapshot(const char* name) {
+    for (int i = 0; i < g_task_prev_count; i++) {
+        if (strncmp(g_task_prev[i].name, name, sizeof(g_task_prev[i].name)) == 0) {
+            return &g_task_prev[i];
+        }
+    }
+    return nullptr;
+}
+
+esp_err_t HandleTasks(httpd_req_t* req) {
+    NoteClientActivity();
+    const UBaseType_t need = uxTaskGetNumberOfTasks() + 4;
+    TaskStatus_t* list = static_cast<TaskStatus_t*>(malloc(sizeof(TaskStatus_t) * need));
+    if (list == nullptr) {
+        return ReplyJson(req, "{\"ok\":false,\"err\":\"oom\"}");
+    }
+    const UBaseType_t count = uxTaskGetSystemState(list, need, nullptr);
+    const int64_t now = esp_timer_get_time();
+    const int64_t window_us = g_task_prev_us == 0 ? 0 : now - g_task_prev_us;
+
+    // 第一遍算窗口内的总运行时间，第二遍才能换算成千分比
+    uint64_t total = 0;
+    for (UBaseType_t i = 0; i < count; i++) {
+        const TaskCpuSnapshot* prev = FindPrevSnapshot(list[i].pcTaskName);
+        if (prev != nullptr) {
+            total += static_cast<uint32_t>(list[i].ulRunTimeCounter - prev->counter);
+        }
+    }
+
+    static char body[2560];
+    int n = snprintf(body, sizeof(body), "{\"window_ms\":%ld,\"tasks\":[",
+                     static_cast<long>(window_us / 1000));
+    bool first = true;
+    for (UBaseType_t i = 0; i < count && n < static_cast<int>(sizeof(body)) - 96; i++) {
+        const TaskCpuSnapshot* prev = FindPrevSnapshot(list[i].pcTaskName);
+        const uint32_t delta =
+            prev == nullptr ? 0 : static_cast<uint32_t>(list[i].ulRunTimeCounter - prev->counter);
+        const uint32_t permille =
+            (total == 0) ? 0 : static_cast<uint32_t>(delta * 1000ULL / total);
+        n += snprintf(body + n, sizeof(body) - n,
+                      "%s{\"n\":\"%s\",\"cpu\":%lu,\"stk\":%lu,\"pri\":%u}", first ? "" : ",",
+                      list[i].pcTaskName, static_cast<unsigned long>(permille),
+                      static_cast<unsigned long>(list[i].usStackHighWaterMark),
+                      list[i].uxBasePriority);
+        first = false;
+    }
+    snprintf(body + n, sizeof(body) - n, "]}");
+
+    // 保存本次快照，供下次差分
+    g_task_prev_count = 0;
+    for (UBaseType_t i = 0; i < count && g_task_prev_count < kMaxTaskSnapshots; i++) {
+        TaskCpuSnapshot& s = g_task_prev[g_task_prev_count++];
+        snprintf(s.name, sizeof(s.name), "%s", list[i].pcTaskName);
+        s.counter = list[i].ulRunTimeCounter;
+        s.stack_words = list[i].usStackHighWaterMark;
+    }
+    g_task_prev_us = now;
+
+    free(list);
+    return ReplyJson(req, body);
+}
+
 // CAMERA_MODE_SWITCH: 录制/拍照两种取图模式。录制模式换 320x240 YUV422
 // （约 9fps，给 NAS 录像用），拍照模式回 640x480 RGB565（给大模型看图）。
 // 切换要停流重建缓冲，所以有客户端正在拉流时直接拒绝，让调用方先断开。
@@ -743,6 +828,7 @@ bool StartControlServer() {
     RegisterRoute(g_ctrl_server, "/mirror", HTTP_GET, HandleMirror);
     RegisterRoute(g_ctrl_server, "/status", HTTP_GET, HandleStatus);
     RegisterRoute(g_ctrl_server, "/net", HTTP_GET, HandleNet);
+    RegisterRoute(g_ctrl_server, "/tasks", HTTP_GET, HandleTasks);
     RegisterRoute(g_ctrl_server, "/record", HTTP_GET, HandleRecord);
     // 只有板级真的注入了 IMU 才挂这两个路由，没注入的板子上访问会 404，
     // 不会返回一个误导性的 ready:false。
