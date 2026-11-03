@@ -624,6 +624,13 @@ bool StartControlServer() {
     // ——HTTP 直接 404，没有任何日志，看起来就像「这个端点没实现」。
     // /imu/zero 就是这么丢的。以后再加端点也不用回来改这里。
     config.max_uri_handlers = 16;
+    // httpd 只有一条任务，串行跑所有 handler：任何一个连接只要请求头没收齐，
+    // 任务就阻塞在这个 socket 的 recv 上，期间**所有端点**（含 20Hz 的 /imu）
+    // 全在排队。默认 5 秒，弱网下一次丢包足以让姿态流冻住一秒以上——这正是
+    // App 里"偶尔卡顿 + 时延突然跳到 1000ms"的来源。压到 1 秒，客户端断连
+    // 也会立刻把 recv 唤醒，最坏阻塞时间不再由默认值兜底。
+    config.recv_wait_timeout = 1;
+    config.send_wait_timeout = 1;
 
     if (httpd_start(&g_ctrl_server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "control server start failed");
