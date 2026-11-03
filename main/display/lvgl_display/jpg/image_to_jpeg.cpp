@@ -1,6 +1,7 @@
 #include <esp_attr.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <stddef.h>
 #include <string.h>
 #include <utility>
@@ -357,7 +358,10 @@ static bool encode_with_esp_new_jpeg(const uint8_t* src, size_t src_len, uint16_
 
     jpeg_pixel_format_t enc_src_type = JPEG_PIXEL_FORMAT_RGB888;
     int enc_in_size = 0;
+    // JPEG_STAGE_PROBE: 拆分「格式转换」与「实际编码」的耗时
+    const int64_t t_conv0 = esp_timer_get_time();
     uint8_t* enc_in = convert_input_to_encoder_buf(src, width, height, format, &enc_src_type, &enc_in_size);
+    const int64_t t_conv1 = esp_timer_get_time();
     if (!enc_in) {
         ESP_LOGE(TAG, "alloc/convert input failed");
         return false;
@@ -394,8 +398,17 @@ static bool encode_with_esp_new_jpeg(const uint8_t* src, size_t src_len, uint16_
 
     int out_len = 0;
     ret = jpeg_enc_process(h, enc_in, enc_in_size, outbuf, (int)out_cap, &out_len);
+    const int64_t t_enc1 = esp_timer_get_time();
     jpeg_enc_close(h);
     jpeg_free_align(enc_in);
+
+    // JPEG_STAGE_PROBE: 每 5 帧打一行，避免刷屏
+    static int stage_log_counter = 0;
+    if (++stage_log_counter % 5 == 1) {
+        ESP_LOGI("jpeg_probe", "%ux%u fmt=%lu | convert %lld ms | encode %lld ms", (unsigned)width,
+                 (unsigned)height, (unsigned long)format, (long long)((t_conv1 - t_conv0) / 1000),
+                 (long long)((t_enc1 - t_conv1) / 1000));
+    }
 
     if (ret != JPEG_ERR_OK) {
         free(outbuf);
