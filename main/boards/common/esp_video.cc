@@ -435,8 +435,21 @@ bool EspVideo::GetJpegFrame(std::vector<uint8_t>& out) {
     }
     uint16_t width = frame_.width ? frame_.width : 320;
     uint16_t height = frame_.height ? frame_.height : 240;
+    uint8_t* enc_src = frame_.data;
+    size_t enc_len = frame_.len;
+    v4l2_pix_fmt_t enc_fmt = frame_.format;
+    // CAMERA_MODE_SWITCH: 录制模式先把整帧降到 320x240，编码量只剩 1/4
+    const int64_t t_scale0 = esp_timer_get_time();
+    if (recording_mode_ && ScaleFrameTo(320, 240)) {
+        enc_src = scale_buf_.data();
+        enc_len = static_cast<size_t>(320) * 240 * 2;
+        enc_fmt = V4L2_PIX_FMT_RGB565;
+        width = 320;
+        height = 240;
+    }
+    perf_.scale_us = esp_timer_get_time() - t_scale0;
     bool ok = image_to_jpeg_cb(
-        frame_.data, frame_.len, width, height, frame_.format, 80,
+        enc_src, enc_len, width, height, enc_fmt, 80,
         [](void* arg, size_t index, const void* data, size_t len) -> size_t {
             auto* buf = static_cast<std::vector<uint8_t>*>(arg);
             if (index == 0 && data != nullptr && len > 0) {
@@ -458,16 +471,71 @@ bool EspVideo::GetJpegFrame(std::vector<uint8_t>& out) {
     static int perf_log_counter = 0;
     if (++perf_log_counter % 5 == 1) {
         ESP_LOGI(TAG,
-                 "perf %ux%u raw=%uKB jpeg=%uKB | dbuf %lld | rotate %lld | display %lld | jpeg "
-                 "%lld | capture %lld | total %lld ms",
+                 "perf %ux%u raw=%uKB jpeg=%uKB | dbuf %lld | rotate %lld | scale %lld | jpeg "
+                 "%lld | total %lld ms",
                  (unsigned)perf_.width, (unsigned)perf_.height, (unsigned)(perf_.raw_len / 1024),
                  (unsigned)(perf_.jpeg_len / 1024), (long long)(perf_.dbuf_us / 1000),
-                 (long long)(perf_.rotate_us / 1000), (long long)(perf_.display_us / 1000),
-                 (long long)(perf_.jpeg_us / 1000),
-                 (long long)((t_capture_done - t_all_start) / 1000),
-                 (long long)(perf_.total_us / 1000));
+                 (long long)(perf_.rotate_us / 1000), (long long)(perf_.scale_us / 1000),
+                 (long long)(perf_.jpeg_us / 1000), (long long)(perf_.total_us / 1000));
     }
     return !out.empty();
+}
+
+// CAMERA_MODE_SWITCH: 录制模式把整帧降采样到 320x240 再编码。
+// 原本打算直接切 sensor 输出格式，但 esp_video 的设备层在创建时就把宽高写死了
+// （common_video_set_format 里要求 pix.width == 当前采集宽度），VIDIOC_S_FMT
+// 只能换像素格式、改不了尺寸，所以只能采集完自己缩。
+bool EspVideo::ScaleFrameTo(uint16_t dst_w, uint16_t dst_h) {
+    if (frame_.data == nullptr || frame_.format != V4L2_PIX_FMT_RGB565) {
+        return false;
+    }
+    if (scale_handle_ == nullptr || scale_src_w_ != frame_.width ||
+        scale_src_h_ != frame_.height || scale_dst_w_ != dst_w || scale_dst_h_ != dst_h) {
+        if (scale_handle_ != nullptr) {
+            esp_imgfx_scale_close(scale_handle_);
+            scale_handle_ = nullptr;
+        }
+        esp_imgfx_scale_cfg_t cfg = {};
+        cfg.in_res.width = static_cast<int16_t>(frame_.width);
+        cfg.in_res.height = static_cast<int16_t>(frame_.height);
+        cfg.in_pixel_fmt = ESP_IMGFX_PIXEL_FMT_RGB565_LE;
+        cfg.scale_res.width = static_cast<int16_t>(dst_w);
+        cfg.scale_res.height = static_cast<int16_t>(dst_h);
+        // 整数 2:1 降采样，用最快那档；双线性在实时流里不值这个时间
+        cfg.filter_type = ESP_IMGFX_SCALE_FILTER_TYPE_DOWN_RESAMPLE;
+        if (esp_imgfx_scale_open(&cfg, &scale_handle_) != ESP_IMGFX_ERR_OK) {
+            ESP_LOGE(TAG, "scale_open failed");
+            scale_handle_ = nullptr;
+            return false;
+        }
+        scale_src_w_ = frame_.width;
+        scale_src_h_ = frame_.height;
+        scale_dst_w_ = dst_w;
+        scale_dst_h_ = dst_h;
+    }
+    const size_t need = static_cast<size_t>(dst_w) * dst_h * 2;
+    if (scale_buf_.size() < need) {
+        scale_buf_.resize(need);
+    }
+    esp_imgfx_data_t src = {};
+    src.data = frame_.data;
+    src.data_len = static_cast<uint32_t>(frame_.len);
+    esp_imgfx_data_t dst = {};
+    dst.data = scale_buf_.data();
+    dst.data_len = static_cast<uint32_t>(need);
+    if (esp_imgfx_scale_process(scale_handle_, &src, &dst) != ESP_IMGFX_ERR_OK) {
+        return false;
+    }
+    return true;
+}
+
+bool EspVideo::SetRecordingMode(bool recording) {
+    if (recording_mode_ == recording) {
+        return true;
+    }
+    recording_mode_ = recording;
+    ESP_LOGI(TAG, "recording_mode = %d (320x240 downscale)", (int)recording);
+    return true;
 }
 
 // LOCAL_CONTROL_PATCH: 整帧旋转 180°。180° 等于水平镜像 + 垂直镜像，也就是把像素首尾

@@ -29,6 +29,14 @@ public:
         (void)out;
         return false;
     }
+
+    // CAMERA_MODE_SWITCH: 录制 / 拍照两种取图模式。录制用低分辨率高帧率，
+    // 拍照用全分辨率保画质。不支持切换的板型返回 false，调用方沿用默认模式。
+    virtual bool SetRecordingMode(bool recording) {
+        (void)recording;
+        return false;
+    }
+    virtual bool IsRecordingMode() const { return false; }
 };
 
 #endif  // CAMERA_H

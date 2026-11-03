@@ -10,6 +10,7 @@
 #include <freertos/queue.h>
 
 #include "camera.h"
+#include "esp_imgfx_scale.h"
 #include "esp_video_init.h"
 #include "jpg/image_to_jpeg.h"
 
@@ -72,6 +73,18 @@ private:
     bool rotate180_ = true;
     bool mirror_h_ = false;
 
+    // CAMERA_MODE_SWITCH: 录制模式下把 640x480 降采样到 320x240 再送编码。
+    // sensor 固定 640x480 输出：esp_video 的设备层在创建时就把宽高写死了，
+    // VIDIOC_S_FMT 改不动尺寸，只能自己缩。结果放在 scale_buf_。
+    bool ScaleFrameTo(uint16_t dst_w, uint16_t dst_h);
+    bool recording_mode_ = false;
+    std::vector<uint8_t> scale_buf_;
+    esp_imgfx_scale_handle_t scale_handle_ = nullptr;
+    uint16_t scale_src_w_ = 0;
+    uint16_t scale_src_h_ = 0;
+    uint16_t scale_dst_w_ = 0;
+    uint16_t scale_dst_h_ = 0;
+
 public:
     // CAMERA_PERF_PROBE: 分段耗时探针，用于定位抓帧链路的真实瓶颈。
     // 只在 GetJpegFrame()（局域网图传/拍照）里打点，不影响云端拍照链路。
@@ -79,6 +92,7 @@ public:
         int64_t dbuf_us = 0;     // DQBUF x3 + PSRAM 拷贝 + 字节序转换
         int64_t rotate_us = 0;   // 180° 旋转 + 水平镜像
         int64_t display_us = 0;  // LCD 预览刷新
+        int64_t scale_us = 0;    // 录制模式降采样到 320x240
         int64_t jpeg_us = 0;     // 软件 JPEG 编码
         int64_t total_us = 0;    // Capture + JPEG 全程
         uint16_t width = 0;
@@ -86,6 +100,11 @@ public:
         size_t raw_len = 0;
         size_t jpeg_len = 0;
     };
+    // CAMERA_MODE_SWITCH: 录制模式把取到的帧降采样到 320x240 再编码，
+    // 编码量降到 1/4；拍照模式保持 640x480 全分辨率。
+    bool SetRecordingMode(bool recording) override;
+    bool IsRecordingMode() const override { return recording_mode_; }
+
     const CapturePerf& GetCapturePerf() const { return perf_; }
 
     // CAMERA_PERF_PROBE: 局域网图传时不需要刷新 LCD 预览（屏上显示的是表情），

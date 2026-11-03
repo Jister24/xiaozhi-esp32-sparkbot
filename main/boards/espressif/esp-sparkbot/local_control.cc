@@ -331,14 +331,41 @@ esp_err_t HandleStatus(httpd_req_t* req) {
 #endif
     snprintf(body, sizeof(body),
              "{\"ok\":true,\"ip\":\"%s\",\"x\":%.2f,\"y\":%.2f,\"uptime_s\":%lld,"
-             "\"camera\":%s,\"rot\":%s,\"mirror\":%s,\"streams\":%d,\"ps\":\"%s\"%s%s%s}",
+             "\"camera\":%s,\"rot\":%s,\"mirror\":%s,\"recording\":%s,\"streams\":%d,"
+             "\"ps\":\"%s\"%s%s%s}",
              g_ip, g_speed_x, g_speed_y,
              (long long)((esp_timer_get_time() - g_boot_us) / 1000000),
              Board::GetInstance().GetCamera() != nullptr ? "true" : "false",
              g_rot180 ? "true" : "false", g_mirror_h ? "true" : "false",
+             (Board::GetInstance().GetCamera() != nullptr &&
+              Board::GetInstance().GetCamera()->IsRecordingMode())
+                 ? "true"
+                 : "false",
              g_stream_clients,
              g_ps_active ? "none" : "min_modem",
              flush, battery, chassis);
+    return ReplyJson(req, body);
+}
+
+// CAMERA_MODE_SWITCH: 录制/拍照两种取图模式。录制模式换 320x240 YUV422
+// （约 9fps，给 NAS 录像用），拍照模式回 640x480 RGB565（给大模型看图）。
+// 切换要停流重建缓冲，所以有客户端正在拉流时直接拒绝，让调用方先断开。
+esp_err_t HandleRecord(httpd_req_t* req) {
+    NoteClientActivity();
+    Camera* camera = Board::GetInstance().GetCamera();
+    if (camera == nullptr) {
+        return ReplyJson(req, "{\"ok\":false,\"err\":\"no camera\"}");
+    }
+    float on = 1.0f;
+    QueryFloat(req, "on", &on);
+    if (g_stream_clients > 0) {
+        return ReplyJson(req, "{\"ok\":false,\"err\":\"stream active, stop it first\"}");
+    }
+    if (!camera->SetRecordingMode(on != 0.0f)) {
+        return ReplyJson(req, "{\"ok\":false,\"err\":\"switch failed\"}");
+    }
+    char body[96];
+    snprintf(body, sizeof(body), "{\"ok\":true,\"recording\":%s}", on != 0.0f ? "true" : "false");
     return ReplyJson(req, body);
 }
 
@@ -610,6 +637,7 @@ bool StartControlServer() {
     RegisterRoute(g_ctrl_server, "/rot", HTTP_GET, HandleRot);
     RegisterRoute(g_ctrl_server, "/mirror", HTTP_GET, HandleMirror);
     RegisterRoute(g_ctrl_server, "/status", HTTP_GET, HandleStatus);
+    RegisterRoute(g_ctrl_server, "/record", HTTP_GET, HandleRecord);
     // 只有板级真的注入了 IMU 才挂这两个路由，没注入的板子上访问会 404，
     // 不会返回一个误导性的 ready:false。
     if (g_imu) {
