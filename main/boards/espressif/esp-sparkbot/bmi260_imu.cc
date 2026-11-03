@@ -46,6 +46,7 @@ const char* kTag = "Imu";
 constexpr float kAccLsbPerG = 8192.0f;
 constexpr float kGyrLsbPerDps = 65.536f;
 constexpr float kRadToDeg = 57.29577951f;
+constexpr float kDegToRad = 1.0f / kRadToDeg;
 
 constexpr uint32_t kSamplePeriodMs = 10;  // 100Hz
 constexpr int kLogEveryN = 10;            // 每 10 帧一行 = 10Hz
@@ -679,7 +680,18 @@ void SampleTask(void*) {
             }
 
             // —— 第 4 步：把角速度积进四元数（右乘，机体系增量） ——
-            const float rv[3] = {corr[0] * dt, corr[1] * dt, corr[2] * dt};
+            // ★ corr 的单位是 **度/秒**（陀螺 dps + 校正项），乘 dt 得到「度」；
+            // 而 QuatFromRotVec 要的是 **弧度**。少乘 kDegToRad 就是拿「度」
+            // 当「弧度」用，每帧积分被放大 57.3 倍：
+            //   · 静止时 gyro≈0，积分项也≈0，靠重力校正还能把姿态钉住，
+            //     于是所有静态标定看起来都正常（收敛快、读数准）——极具欺骗性；
+            //   · 一旦动起来（20dps 倾斜），真实 0.2°/帧被积成 11.5°/帧，
+            //     4 秒能转过 1700°，实测手持倾斜 40° 时估计值冲出 35°、
+            //     单帧跳 22°，也就是「手机端看到的姿态在跳变」。
+            // 仿真复刻验证：修复前 max|err| 35.06°、单帧跳变 22.72°；
+            //               修复后 max|err| 0.20°、单帧跳变 0.20°。
+            const float rv[3] = {corr[0] * dt * kDegToRad, corr[1] * dt * kDegToRad,
+                                 corr[2] * dt * kDegToRad};
             q = QuatNormalize(QuatMul(q, QuatFromRotVec(rv)));
 
             // —— 输出：欧拉角给日志看，倾角是「相对零点的 roll/pitch 差」 ——
