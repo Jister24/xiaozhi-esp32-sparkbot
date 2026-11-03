@@ -40,3 +40,11 @@ void LocalControlStart(std::function<void(const char*)> send_command,
 // 板级据此在屏幕上换成睡觉表情（见 esp_sparkbot_board.cc 的 UpdateSleepFace），
 // 有请求进来的一瞬间就会变回 false，脸也跟着醒。
 bool LocalControlPowerSaveOn();
+
+// 上层（application）想不想省电，由板级从 SetPowerSaveLevel 转过来。
+//   low_power = true  → 空闲时可以退到 WIFI_PS_MIN_MODEM
+//   low_power = false → 上层在用（对话 / 联网 / OTA），必须保持 WIFI_PS_NONE
+// 实际档位由 local_control 统一裁决：USB 接主机、最近 2 分钟有客户端请求、
+// 或者上层要性能，任一成立就不省电。板级不要自己再调 esp_wifi_set_ps，
+// 否则两条路径会互相覆盖。
+void LocalControlNotePowerSaveWish(bool low_power);

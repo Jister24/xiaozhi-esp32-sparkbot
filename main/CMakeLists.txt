@@ -1182,6 +1182,9 @@ idf_component_register(SRCS ${SOURCES}
                         esp_driver_ppa
                         esp_driver_tsens
                         esp_driver_touch_sens
+                        # esp-sparkbot：local_control 用 usb_serial_jtag_is_connected()
+                        # 判断「USB 是否插着主机」，据此决定要不要关 Wi-Fi 省电。
+                        esp_driver_usb_serial_jtag
                         esp_app_format
                         app_update
                         spi_flash

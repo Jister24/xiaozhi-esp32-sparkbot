@@ -776,20 +776,22 @@ public:
         return true;
     }
 
-    // Wi-Fi 省电一律关掉，不管上层要哪一级。
+    // Wi-Fi 省电：不在这里直接操作，只把上层的意愿登记给 local_control。
     //
     // application.cc 空闲时会调 SetPowerSaveLevel(LOW_POWER)，底层落到
-    // WIFI_PS_MAX_MODEM：listen interval 被拉到约 1 秒（日志里
-    // "scale listen interval from 1024000 us"），射频绝大部分时间在睡。
-    // 实测两个后果都很致命：
+    // WIFI_PS_MAX_MODEM：监听间隔被拉到约 1 秒（日志里 "scale listen interval
+    // from 1024000 us"），射频绝大部分时间在睡。实测两个后果都很致命：
     //   1) 收不到别人发来的 ARP 广播请求 —— 手机 ARP 表一过期就永远
     //      "Destination Host Unreachable"（实测 100% 丢包）；而 Mac 因为
     //      早就缓存了 MAC、直接单播，看起来一直"正常"，把方向带偏。
     //   2) Mac 侧 ping 平均 473ms（局域网正常 20~30ms），HTTP 一次往返近 1 秒。
-    // 这台机器本身就是遥控 / 体感手柄的被控端，可发现性和延迟远比那点功耗重要。
+    // 但一刀切钉死 PERFORMANCE 也不行：纯电池待机时射频常开，白白耗电。
+    //
+    // 所以只转交意愿，档位交给 local_control 的 PowerModeTask 统一裁决：
+    //   USB 接主机 / 最近 2 分钟有客户端 / 上层要性能 → WIFI_PS_NONE
+    //   纯电池静置 2 分钟且上层空闲            → WIFI_PS_MIN_MODEM（不是 MAX_MODEM）
     virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
-        (void)level;
-        WifiBoard::SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+        LocalControlNotePowerSaveWish(level != PowerSaveLevel::PERFORMANCE);
     }
 };
 

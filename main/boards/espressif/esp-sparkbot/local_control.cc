@@ -1,6 +1,14 @@
 #include "local_control.h"
 
 #include <esp_http_server.h>
+#include <sdkconfig.h>
+
+#if defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG) || \
+    defined(CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG)
+#include <driver/usb_serial_jtag.h>
+#define SPARKBOT_HAVE_USB_SERIAL_JTAG 1
+#endif
+
 #include <esp_log.h>
 #include <esp_netif.h>
 #include <esp_timer.h>
@@ -136,17 +144,40 @@ esp_err_t ReplyText(httpd_req_t* req, const char* text) {
 }
 
 // ---------------------------------------------------------------------------
-// Wi-Fi 省电模式：有客户端在用就退出，静默一段时间再回去
+// Wi-Fi 省电模式：USB 供电 / 有客户端 / 上层在用，就退出；纯电池静置 2 分钟再回去
 // ---------------------------------------------------------------------------
-// IDF 默认是 WIFI_PS_MIN_MODEM：射频每 100ms 才醒一次收包。对语音对话无所谓，
-// 但遥控是实时操作，实测往返延迟从 Mac 上的 60ms 劣化到手机上 500~2200ms，
-// 而且抖动极大。这里不给全局关省电（待机电流会明显上去），改成按有没有人在用：
-// 收到任何一次 HTTP 请求就刷新计时，活跃期内用 WIFI_PS_NONE，静默超过
-// kPsIdleSec 秒退回 MIN_MODEM。
-constexpr int64_t kPsIdleUs = 30LL * 1000 * 1000;
+// 三档实际落到什么（见 78__esp-wifi-connect/wifi_station.cc）：
+//   PERFORMANCE = WIFI_PS_NONE       射频常开
+//   BALANCED    = WIFI_PS_MIN_MODEM  每 100ms 醒一次
+//   LOW_POWER   = WIFI_PS_MAX_MODEM  监听间隔被拉到约 1 秒
+//
+// MAX_MODEM 在这台机器上是**不能用**的一档：实测它连 ARP 广播请求都收不到，
+// 手机邻居表一过期就永远 "Destination Host Unreachable"（100% 丢包），
+// RTT 743 / 1464ms。所以省电只退到 MIN_MODEM —— 100ms 唤醒间隔足够接住
+// ARP 和 TCP 握手，功耗比 NONE 低，延迟又比 MAX_MODEM 好一个数量级。
+//
+// 退出省电的条件（任一成立）：
+//   · USB 连着主机（插电脑烧固件 / adb / 看串口日志）；
+//   · 最近 kPsIdleUs（2 分钟）内有 HTTP 请求（姿态页 20Hz 轮询时恒成立）；
+//   · 上层（application）当前要求 PERFORMANCE —— 对话中、联网握手、OTA 都算。
+constexpr int64_t kPsIdleUs = 120LL * 1000 * 1000;  // 纯电池静置 2 分钟
 
 volatile int64_t g_last_request_us = 0;
-bool g_ps_active = false;  // 当前是否真的处在「已退出省电」状态
+bool g_ps_active = false;               // 当前是否真的处在「已退出省电」状态
+volatile bool g_want_low_power = true;  // 上层意愿：true = 允许省电
+volatile bool g_usb_present = false;    // USB 是否连着真主机（不是充电器）
+volatile int32_t g_idle_sec = -1;       // 诊断用，-1 = 从来没收到过请求
+
+// usb_serial_jtag_is_connected() 看的是 USB 枚举状态：插电脑会被枚举 → true，
+// 插充电头/充电宝时 D+/D- 不通信、不会枚举 → false。这正是「插着 USB」想要的语义：
+// 接着电脑说明可能有人在调试，别省电；插着充电器没人在用，该省还是省。
+bool UsbHostConnected() {
+#ifdef SPARKBOT_HAVE_USB_SERIAL_JTAG
+    return usb_serial_jtag_is_connected();
+#else
+    return false;
+#endif
+}
 
 // Wi-Fi 没起来时 esp_wifi_set_ps 会报 ESP_ERR_WIFI_NOT_STARTED，这是正常的：
 // 本任务在联网前就已经在跑了，下一轮重试即可，不要刷警告。
@@ -157,12 +188,14 @@ void ApplyPowerMode(bool active) {
     esp_err_t err = esp_wifi_set_ps(active ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
     if (err == ESP_OK) {
         g_ps_active = active;
-        ESP_LOGI(TAG, "wifi power save %s", active ? "off (远程客户端活跃)" : "on (空闲)");
+        ESP_LOGI(TAG, "wifi power save %s (usb=%d idle=%lds app_low_power=%d)",
+                 active ? "off" : "on", (int)g_usb_present, (long)g_idle_sec,
+                 (int)g_want_low_power);
     }
 }
 
 // 每个 HTTP 请求进来都调一次。发现已经掉回省电就当场切回来，
-// 不等后台任务那 500ms 的轮询——第一帧遥控指令不该再吃一次 1 秒延迟。
+// 不等后台任务那 500ms 的轮询——第一帧遥控指令不该再吃一次唤醒延迟。
 void NoteClientActivity() {
     g_last_request_us = esp_timer_get_time();
     ApplyPowerMode(true);
@@ -170,9 +203,15 @@ void NoteClientActivity() {
 
 void PowerModeTask(void*) {
     while (true) {
+        const int64_t now = esp_timer_get_time();
         const int64_t last = g_last_request_us;
-        const bool active = last != 0 && (esp_timer_get_time() - last) < kPsIdleUs;
-        ApplyPowerMode(active);
+        g_usb_present = UsbHostConnected();
+        g_idle_sec = (last == 0) ? -1 : static_cast<int32_t>((now - last) / 1000000);
+        const bool client_active = last != 0 && (now - last) < kPsIdleUs;
+        // 上层在要 PERFORMANCE（对话 / 联网 / OTA）时也按活跃处理：
+        // 这些场景丢一帧语音比省那几毫安严重得多。
+        const bool app_active = !g_want_low_power;
+        ApplyPowerMode(g_usb_present || client_active || app_active);
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
@@ -383,8 +422,10 @@ esp_err_t HandleNet(httpd_req_t* req) {
 
     n += snprintf(body + n, sizeof(body) - n,
                   "{\"ssid\":\"%s\",\"bssid\":\"%s\",\"rssi\":%d,\"ch\":%d,\"ps\":%d,"
+                  "\"usb\":%d,\"idle_s\":%ld,\"want_low\":%d,"
                   "\"arp_size\":%d,\"arp\":[",
-                  ssid, bssid, rssi, channel, static_cast<int>(ps), ARP_TABLE_SIZE);
+                  ssid, bssid, rssi, channel, static_cast<int>(ps), (int)g_usb_present,
+                  (long)g_idle_sec, (int)g_want_low_power, ARP_TABLE_SIZE);
 
     bool first = true;
     for (size_t i = 0; i < ARP_TABLE_SIZE && n < static_cast<int>(sizeof(body)) - 96; i++) {
@@ -407,7 +448,8 @@ esp_err_t HandleNet(httpd_req_t* req) {
 // CAMERA_MODE_SWITCH: 录制/拍照两种取图模式。录制模式换 320x240 YUV422
 // （约 9fps，给 NAS 录像用），拍照模式回 640x480 RGB565（给大模型看图）。
 // 切换要停流重建缓冲，所以有客户端正在拉流时直接拒绝，让调用方先断开。
-esp_err_t HandleRecord(httpd_req_t* req) {    NoteClientActivity();
+esp_err_t HandleRecord(httpd_req_t* req) {
+    NoteClientActivity();
     Camera* camera = Board::GetInstance().GetCamera();
     if (camera == nullptr) {
         return ReplyJson(req, "{\"ok\":false,\"err\":\"no camera\"}");
@@ -779,6 +821,18 @@ void BootstrapTask(void*) {
 }
 
 }  // namespace
+
+// 上层（application.cc）的省电意愿转到这里登记，板级不再自己调 esp_wifi_set_ps。
+// 真正的档位由 PowerModeTask 统一裁决——USB 供电、有没有客户端、上层意愿三条一起看。
+// 分成两处各调一次会互相覆盖：之前板级硬压 PERFORMANCE，就把「纯电池静置 2 分钟
+// 回省电」这条彻底压死了（永远 NONE，待机电流下不来）。
+void LocalControlNotePowerSaveWish(bool low_power) {
+    if (g_want_low_power == low_power) {
+        return;
+    }
+    g_want_low_power = low_power;
+    ESP_LOGI(TAG, "app power save wish: %s", low_power ? "low" : "performance");
+}
 
 // 板级要判断「现在是不是低功耗」，所以把状态开放出去。
 // g_ps_active 只在省电与否切换时改写，读一个 bool 不会撕裂；读到旧值最多让
