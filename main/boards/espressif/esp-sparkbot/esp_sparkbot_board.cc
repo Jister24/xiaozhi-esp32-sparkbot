@@ -775,6 +775,22 @@ public:
         level = battery_.Percent();
         return true;
     }
+
+    // Wi-Fi 省电一律关掉，不管上层要哪一级。
+    //
+    // application.cc 空闲时会调 SetPowerSaveLevel(LOW_POWER)，底层落到
+    // WIFI_PS_MAX_MODEM：listen interval 被拉到约 1 秒（日志里
+    // "scale listen interval from 1024000 us"），射频绝大部分时间在睡。
+    // 实测两个后果都很致命：
+    //   1) 收不到别人发来的 ARP 广播请求 —— 手机 ARP 表一过期就永远
+    //      "Destination Host Unreachable"（实测 100% 丢包）；而 Mac 因为
+    //      早就缓存了 MAC、直接单播，看起来一直"正常"，把方向带偏。
+    //   2) Mac 侧 ping 平均 473ms（局域网正常 20~30ms），HTTP 一次往返近 1 秒。
+    // 这台机器本身就是遥控 / 体感手柄的被控端，可发现性和延迟远比那点功耗重要。
+    virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
+        (void)level;
+        WifiBoard::SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    }
 };
 
 DECLARE_BOARD(EspSparkBot);

@@ -8,6 +8,9 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
+#include <lwip/etharp.h>
+#include <lwip/ip4_addr.h>
+#include <lwip/netif.h>
 
 #include <cmath>
 #include <cstdio>
@@ -347,11 +350,64 @@ esp_err_t HandleStatus(httpd_req_t* req) {
     return ReplyJson(req, body);
 }
 
+// 网络自检：关联的 AP + 省电档位 + lwIP 的 ARP 表。
+//
+// 「别的设备都能 ping 通，就机器人不通」这种问题，两边各测各的会互相矛盾：
+// 有 ARP 缓存的一方（Mac）一直"正常"，没缓存的一方（手机）永远失败。把机器人
+// 自己的 ARP 表吐出来，才能分清是「请求根本没收到」还是「收到了没回包」。
+//
+// 特别值钱的是 ARP_TABLE_SIZE 只有 10：lwIP 在表满时收到「不在表里的主机」发来的
+// ARP 请求，会先 update 失败然后**直接 return，不回包**，没有任何日志——症状和
+// 「网络不通」一模一样。
+esp_err_t HandleNet(httpd_req_t* req) {
+    NoteClientActivity();
+    char body[1024];
+    int n = 0;
+
+    char ssid[33] = "";
+    char bssid[24] = "";
+    int rssi = 0;
+    int channel = 0;
+    wifi_ap_record_t ap = {};
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        memcpy(ssid, ap.ssid, sizeof(ap.ssid));
+        ssid[32] = '\0';
+        snprintf(bssid, sizeof(bssid), "%02x:%02x:%02x:%02x:%02x:%02x", ap.bssid[0], ap.bssid[1],
+                 ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5]);
+        rssi = ap.rssi;
+        channel = ap.primary;
+    }
+
+    wifi_ps_type_t ps = WIFI_PS_NONE;
+    esp_wifi_get_ps(&ps);
+
+    n += snprintf(body + n, sizeof(body) - n,
+                  "{\"ssid\":\"%s\",\"bssid\":\"%s\",\"rssi\":%d,\"ch\":%d,\"ps\":%d,"
+                  "\"arp_size\":%d,\"arp\":[",
+                  ssid, bssid, rssi, channel, static_cast<int>(ps), ARP_TABLE_SIZE);
+
+    bool first = true;
+    for (size_t i = 0; i < ARP_TABLE_SIZE && n < static_cast<int>(sizeof(body)) - 96; i++) {
+        ip4_addr_t* ip = nullptr;
+        struct netif* netif_of_entry = nullptr;
+        struct eth_addr* eth = nullptr;
+        if (!etharp_get_entry(i, &ip, &netif_of_entry, &eth) || ip == nullptr || eth == nullptr) {
+            continue;
+        }
+        const uint8_t* o = reinterpret_cast<const uint8_t*>(eth);
+        n += snprintf(body + n, sizeof(body) - n,
+                      "%s{\"ip\":\"" IPSTR "\",\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\"}",
+                      first ? "" : ",", IP2STR(ip), o[0], o[1], o[2], o[3], o[4], o[5]);
+        first = false;
+    }
+    snprintf(body + n, sizeof(body) - n, "]}");
+    return ReplyJson(req, body);
+}
+
 // CAMERA_MODE_SWITCH: 录制/拍照两种取图模式。录制模式换 320x240 YUV422
 // （约 9fps，给 NAS 录像用），拍照模式回 640x480 RGB565（给大模型看图）。
 // 切换要停流重建缓冲，所以有客户端正在拉流时直接拒绝，让调用方先断开。
-esp_err_t HandleRecord(httpd_req_t* req) {
-    NoteClientActivity();
+esp_err_t HandleRecord(httpd_req_t* req) {    NoteClientActivity();
     Camera* camera = Board::GetInstance().GetCamera();
     if (camera == nullptr) {
         return ReplyJson(req, "{\"ok\":false,\"err\":\"no camera\"}");
@@ -644,6 +700,7 @@ bool StartControlServer() {
     RegisterRoute(g_ctrl_server, "/rot", HTTP_GET, HandleRot);
     RegisterRoute(g_ctrl_server, "/mirror", HTTP_GET, HandleMirror);
     RegisterRoute(g_ctrl_server, "/status", HTTP_GET, HandleStatus);
+    RegisterRoute(g_ctrl_server, "/net", HTTP_GET, HandleNet);
     RegisterRoute(g_ctrl_server, "/record", HTTP_GET, HandleRecord);
     // 只有板级真的注入了 IMU 才挂这两个路由，没注入的板子上访问会 404，
     // 不会返回一个误导性的 ready:false。
