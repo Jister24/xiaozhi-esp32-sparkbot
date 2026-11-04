@@ -83,7 +83,8 @@ bool GetLatest(ImuReadout* out);
 // 机器人放桌上不一定水平，这个必须能标。
 void Zero();
 
-// 串口波形开关，默认开。验证完可以关掉省日志。
+// 串口波形总开关，默认开。注意即使开着，也只有 /imu 被请求时才会输出，
+// 且限到 1Hz（见 bmi260_imu.cc 的 kLogEveryN / kLogKeepUs）。
 void SetSerialLog(bool on);
 
 uint8_t ChipId();

@@ -4,6 +4,7 @@
 
 #include <esp_log.h>
 #include <esp_rom_sys.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -49,7 +50,20 @@ constexpr float kRadToDeg = 57.29577951f;
 constexpr float kDegToRad = 1.0f / kRadToDeg;
 
 constexpr uint32_t kSamplePeriodMs = 10;  // 100Hz
-constexpr int kLogEveryN = 10;            // 每 10 帧一行 = 10Hz
+
+// —— 串口波形日志 ——
+//
+// 以前是恒定 10Hz 刷屏，跟有没有人在看无关：一行约 95 字节，115200 波特下
+// 光发完就要 8.2ms，10Hz 就是约 8% 的串口带宽，还全同步阻塞在采样任务里，
+// 顺便把启动之后所有有用的日志都淹了。
+//
+// 现在改成「有客户端在读 /imu 才打」，并且降到 1Hz：
+//   · FormatJson() 每被调用一次（即 /imu 被请求一次）就刷新时间戳；
+//   · 采样任务只在时间戳还新鲜时才输出，没客户端时一行都不打；
+//   · kLogKeepUs 是「最后一帧请求之后还继续打多久」——设 5 秒，客户端
+//     拔掉后最多再出 5 行就彻底安静，不用等下一次请求来触发判断。
+constexpr int kLogEveryN = 100;                    // 每 100 帧一行 = 1Hz
+constexpr int64_t kLogKeepUs = 5LL * 1000 * 1000;  // 最后请求后 5 秒内仍算「在看」
 
 // —— 姿态滤波参数，对应 PX4 attitude_estimator_q 的 ATT_W_* ——
 //
@@ -121,6 +135,11 @@ bool g_started = false;
 int g_init_err = 0;
 uint8_t g_chip_id = 0;
 bool g_serial_log = true;
+// 最近一次 /imu 被请求的时刻（微秒）。0 表示开机以来还没人来读过。
+// 单写单读（FormatJson 写、采样任务读）。32 位平台上 int64 读不是原子的，
+// 撕裂最坏就是多打或少打一行波形日志——只影响日志，不影响采样和姿态，所以
+// 不上锁。
+volatile int64_t g_last_request_us = 0;
 const char* g_mode = "unknown";
 
 portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -746,7 +765,13 @@ void SampleTask(void*) {
             g_latest = snap;
             portEXIT_CRITICAL(&g_mux);
 
-            if (g_serial_log && ++log_div >= kLogEveryN) {
+            // 只有「最近有人读过 /imu」才输出波形，且 1Hz。
+            // g_last_request_us == 0 明确表示从没人读过 —— 不能直接相减，
+            // 因为开机前几秒 esp_timer 本身也还是小数字，会误判成「刚请求过」。
+            const int64_t last_req = g_last_request_us;
+            const bool being_watched =
+                last_req != 0 && (esp_timer_get_time() - last_req) < kLogKeepUs;
+            if (g_serial_log && being_watched && ++log_div >= kLogEveryN) {
                 log_div = 0;
                 char bar_x[12];
                 char bar_y[12];
@@ -888,6 +913,10 @@ int FormatJson(char* buf, size_t len) {
     if (buf == nullptr || len == 0) {
         return 0;
     }
+    // 这个函数就是 /imu 的入口，每被请求一次记一次时间戳。
+    // 采样任务据此判断「有没有人在看」，没人看就不打波形日志。
+    g_last_request_us = esp_timer_get_time();
+
     ImuReadout r;
     const bool ok = GetLatest(&r);
 
